@@ -9,6 +9,7 @@ import {
     userSettings,
 } from "@/db/schema";
 import { generateTitleFromTranscription } from "@/lib/ai/generate-title";
+import { makeNodeFetch } from "@/lib/ai/node-fetch";
 import { getTranscriptionStyle } from "@/lib/ai/provider-presets";
 import { decrypt } from "@/lib/encryption";
 import { decryptText, encryptText } from "@/lib/encryption/fields";
@@ -167,6 +168,7 @@ export async function transcribeRecording(
         const openai = new OpenAI({
             apiKey,
             baseURL: credentials.baseUrl || undefined,
+            fetch: makeNodeFetch(),
         });
 
         const storage = await createUserStorageProvider(userId);

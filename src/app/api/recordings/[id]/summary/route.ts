@@ -15,6 +15,7 @@ import {
     getSummaryPromptById,
     type SummaryPromptConfiguration,
 } from "@/lib/ai/summary-presets";
+import { makeNodeFetch } from "@/lib/ai/node-fetch";
 import { requireApiSession } from "@/lib/auth-server";
 import { decrypt } from "@/lib/encryption";
 import {
@@ -156,6 +157,7 @@ export const POST = apiHandler<IdContext>(async (request, context) => {
     const openai = new OpenAI({
         apiKey,
         baseURL: credentials.baseUrl || undefined,
+        fetch: makeNodeFetch(),
     });
 
     // Use a chat model, not whisper
@@ -180,12 +182,27 @@ export const POST = apiHandler<IdContext>(async (request, context) => {
     // the LLM's input contract; ciphertext lives only in the DB.
     const transcriptText = decryptText(transcription.text);
 
+    // Remove words that appear more than 8 times — garbled ASR output
+    // (e.g. a word repeating hundreds of times) causes reasoning models
+    // to enter infinite loops. Normal speech repetition (up to 8×) is kept.
+    const wordCounts: Record<string, number> = {};
+    const deduplicatedWords = transcriptText
+        .split(/(\s+)/)
+        .map((token) => {
+            if (/\s/.test(token)) return token;
+            const lower = token.toLowerCase();
+            wordCounts[lower] = (wordCounts[lower] ?? 0) + 1;
+            return wordCounts[lower] <= 8 ? token : "";
+        })
+        .join("");
+    const dedupedTranscript = deduplicatedWords.replace(/\s{2,}/g, " ").trim();
+
     // Truncate transcription if too long
     const maxLength = 8000;
     const truncatedTranscription =
-        transcriptText.length > maxLength
-            ? `${transcriptText.substring(0, maxLength)}...`
-            : transcriptText;
+        dedupedTranscript.length > maxLength
+            ? `${dedupedTranscript.substring(0, maxLength)}...`
+            : dedupedTranscript;
 
     // Apply AI output language directive (if configured) via the system
     // message rather than the user prompt. This separates concerns: the
@@ -221,10 +238,21 @@ export const POST = apiHandler<IdContext>(async (request, context) => {
             },
         ],
         temperature: 0.5,
-        max_tokens: 2000,
+        max_tokens: 6000,
+        frequency_penalty: 0.2,
     });
 
-    const rawContent = response.choices[0]?.message?.content?.trim() || "";
+    // Reasoning models (e.g. Qwen3 via qwen-nothink alias) sometimes put
+    // their output in `reasoning` instead of `content` when thinking mode
+    // activates. Extract JSON from reasoning as a fallback.
+    let rawContent = response.choices[0]?.message?.content?.trim() ?? "";
+    if (!rawContent) {
+        const reasoning =
+            (response.choices[0]?.message as { reasoning?: string })
+                ?.reasoning ?? "";
+        const jsonMatch = reasoning.match(/(\{[\s\S]*\})\s*$/);
+        rawContent = jsonMatch ? jsonMatch[1].trim() : "";
+    }
 
     // Parse the JSON response
     let summary = "";

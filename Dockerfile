@@ -42,6 +42,9 @@ RUN bun build src/db/migrate-idempotent.ts --target=bun --outfile=migrate-idempo
 #   docker compose exec app bun encrypt-backfill.js [--dry-run]
 RUN bun build scripts/encrypt-backfill.ts --target=bun --outfile=encrypt-backfill.js
 
+# Bundle auto-process worker (sync + transcribe + summarize every 30 min)
+RUN bun build src/autoprocess.ts --target=bun --outfile=autoprocess.js
+
 # Final runtime image
 FROM base AS runner
 WORKDIR /app
@@ -59,6 +62,9 @@ COPY --from=builder /app/migrate-idempotent.js ./migrate-idempotent.js
 
 # Copy bundled encryption backfill script
 COPY --from=builder /app/encrypt-backfill.js ./encrypt-backfill.js
+
+# Copy auto-process worker
+COPY --from=builder /app/autoprocess.js ./autoprocess.js
 
 # Copy migrations folder
 COPY --from=builder /app/src/db/migrations ./src/db/migrations
