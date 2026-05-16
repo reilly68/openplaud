@@ -34,7 +34,7 @@ export function RecordingPlayerHeader({
     onDecodeWaveform,
 }: Props) {
     const metaParts: string[] = [
-        formatDateTime(recording.startTime, "relative"),
+        `${formatDateTime(recording.startTime, "absolute")} (${formatDateTime(recording.startTime, "relative")})`,
         formatDuration(duration || recording.duration / 1000),
         formatBytes(recording.filesize),
     ];
