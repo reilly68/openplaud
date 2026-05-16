@@ -70,8 +70,8 @@ export async function consumeRateLimitBucket(
         .onConflictDoUpdate({
             target: apiRateLimitBuckets.key,
             set: {
-                count: sql<number>`case when ${apiRateLimitBuckets.resetAt} <= ${now} then 1 else ${apiRateLimitBuckets.count} + 1 end`,
-                resetAt: sql<Date>`case when ${apiRateLimitBuckets.resetAt} <= ${now} then ${resetAt} else ${apiRateLimitBuckets.resetAt} end`,
+                count: sql<number>`case when ${apiRateLimitBuckets.resetAt} <= ${now.toISOString()} then 1 else ${apiRateLimitBuckets.count} + 1 end`,
+                resetAt: sql<Date>`case when ${apiRateLimitBuckets.resetAt} <= ${now.toISOString()} then ${resetAt.toISOString()} else ${apiRateLimitBuckets.resetAt} end`,
                 updatedAt: now,
             },
         })
