@@ -145,10 +145,22 @@ export async function generateTitleFromTranscription(
                 },
             ],
             temperature: 0.7,
-            max_tokens: 50, // Titles should be short
+            max_tokens: 200,
         });
 
-        const title = response.choices[0]?.message?.content?.trim() || null;
+        const message = response.choices[0]?.message as {
+            content?: string | null;
+            // biome-ignore lint/suspicious/noExplicitAny: reasoning is a non-standard extension (qwen-nothink)
+            reasoning?: any;
+        };
+        let title = message?.content?.trim() || null;
+
+        // Reasoning fallback for models that return content: null (e.g. qwen-nothink with thinking output)
+        if (!title && message?.reasoning) {
+            const raw = String(message.reasoning);
+            const match = raw.match(/["']?([^"'\n]{3,60})["']?\s*$/m);
+            if (match) title = match[1].trim();
+        }
 
         if (!title) {
             return null;
