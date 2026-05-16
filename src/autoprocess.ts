@@ -38,7 +38,7 @@ async function getSignedCookie(): Promise<string | null> {
     if (!rows.length) return null;
 
     const token = rows[0].token as string;
-    const secret = process.env.BETTER_AUTH_SECRET!;
+    const secret = process.env.BETTER_AUTH_SECRET ?? "";
     const key = await crypto.subtle.importKey(
         "raw",
         new TextEncoder().encode(secret),
