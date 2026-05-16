@@ -7,7 +7,7 @@ echo "⏳ Running database migrations..."
 bun migrate-idempotent.js
 
 echo "🔄 Starting auto-process worker..."
-bun autoprocess.js &
+bun autoprocess.ts &
 
 echo "🚀 Starting application..."
 exec "$@"
