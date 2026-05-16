@@ -42,6 +42,23 @@ function isOggContainer(audioBuffer: Buffer): boolean {
 }
 
 /**
+ * Detect RIFF container by magic bytes (`RIFF`). Some encoders produce
+ * RIFF-wrapped audio (WAV or RIFF-MP3) even when the filename says `.mp3`.
+ * Sending such a file as `audio/mpeg` makes ffmpeg fail with "invalid start
+ * code ID3[4] in RIFF header"; labelling it as WAV lets ffmpeg parse the
+ * RIFF container correctly.
+ */
+function isRiffContainer(audioBuffer: Buffer): boolean {
+    if (audioBuffer.length < 4) return false;
+    return (
+        audioBuffer[0] === 0x52 && // R
+        audioBuffer[1] === 0x49 && // I
+        audioBuffer[2] === 0x46 && // F
+        audioBuffer[3] === 0x46 // F
+    );
+}
+
+/**
  * Build the `File` object passed to `openai.audio.transcriptions.create`.
  *
  * - `storagePath` is the on-disk path (used as an extension hint when the
@@ -57,15 +74,18 @@ export function buildAudioFile(
     decryptedFilename: string,
 ): BuildAudioFileResult {
     const isOgg = isOggContainer(audioBuffer);
+    const isRiff = !isOgg && isRiffContainer(audioBuffer);
 
-    const ext = isOgg
-        ? "ogg"
-        : storagePath.split(".").pop()?.toLowerCase() || "mp3";
+    const ext = isOgg ? "ogg" : isRiff ? "wav" : storagePath.split(".").pop()?.toLowerCase() || "mp3";
 
-    // Trust the OGG magic byte over any path-derived guess, otherwise
-    // delegate to the shared MIME map so wav/m4a/flac/etc. don't fall
-    // back to opus.
-    const contentType = isOgg ? "audio/ogg" : getAudioMimeType(storagePath);
+    // Trust magic bytes over path-derived guesses: OGG → audio/ogg,
+    // RIFF → audio/wav (covers RIFF-wrapped MP3 and standard WAV),
+    // otherwise delegate to the shared MIME map.
+    const contentType = isOgg
+        ? "audio/ogg"
+        : isRiff
+          ? "audio/wav"
+          : getAudioMimeType(storagePath);
 
     const filename = decryptedFilename.match(/\.\w{2,4}$/)
         ? decryptedFilename
