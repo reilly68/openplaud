@@ -145,7 +145,7 @@ export async function generateTitleFromTranscription(
                 },
             ],
             temperature: 0.7,
-            max_tokens: 200,
+            max_tokens: 5000,
         });
 
         const message = response.choices[0]?.message as {
@@ -155,11 +155,14 @@ export async function generateTitleFromTranscription(
         };
         let title = message?.content?.trim() || null;
 
-        // Reasoning fallback for models that return content: null (e.g. qwen-nothink with thinking output)
+        // Reasoning fallback for models that return content: null (e.g. qwen-nothink hitting token budget)
         if (!title && message?.reasoning) {
             const raw = String(message.reasoning);
-            const match = raw.match(/["']?([^"'\n]{3,60})["']?\s*$/m);
-            if (match) title = match[1].trim();
+            // Look for explicit output marker: [Output Generation] -> <title>
+            const outputMatch = raw.match(/\[Output Generation\]\s*->\s*([^\n\r*]+)/i);
+            if (outputMatch) {
+                title = outputMatch[1].replace(/\*+/g, "").trim();
+            }
         }
 
         if (!title) {
