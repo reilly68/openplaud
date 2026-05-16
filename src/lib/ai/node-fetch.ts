@@ -19,8 +19,8 @@
  * handing it to the SDK's JSON parser.
  */
 
-import http from "http";
-import https from "https";
+import http from "node:http";
+import https from "node:https";
 
 const TWO_HOURS_MS = 7_200_000;
 
@@ -55,7 +55,7 @@ export function makeNodeFetch(timeoutMs = TWO_HOURS_MS): typeof fetch {
             ) {
                 // FormData — used by OpenAI SDK for /v1/audio/transcriptions
                 const fd = body as FormData;
-                const boundary = "openplaud" + Date.now().toString(16);
+                const boundary = `openplaud${Date.now().toString(16)}`;
                 const parts: Buffer[] = [];
                 for (const [key, value] of fd.entries()) {
                     if (typeof value === "string") {

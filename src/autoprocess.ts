@@ -12,7 +12,7 @@
  * DB using HMAC-SHA256(token, BETTER_AUTH_SECRET) — no cookie file needed.
  */
 
-import http from "http";
+import http from "node:http";
 
 const WORKER_INTERVAL_MS = 30 * 60 * 1000;
 const STARTUP_DELAY_MS = 60 * 1000;
@@ -64,7 +64,7 @@ async function getSignedCookie(): Promise<string | null> {
             console.log("[autoprocess] Session extended to 365 days");
         }
 
-        return `better-auth.session_token=${encodeURIComponent(token + "." + sigB64)}`;
+        return `better-auth.session_token=${encodeURIComponent(`${token}.${sigB64}`)}`;
     } finally {
         await db.end();
     }
@@ -96,13 +96,15 @@ function httpPost(
             },
             (res) => {
                 let raw = "";
-                res.on("data", (c: Buffer) => (raw += c));
+                res.on("data", (c: Buffer) => {
+                    raw += c;
+                });
                 res.on("end", () => {
                     try {
                         resolve(JSON.parse(raw));
                     } catch {
                         reject(
-                            new Error("JSON parse error: " + raw.slice(0, 120)),
+                            new Error(`JSON parse error: ${raw.slice(0, 120)}`),
                         );
                     }
                 });
