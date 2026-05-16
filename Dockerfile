@@ -43,7 +43,7 @@ RUN bun build src/db/migrate-idempotent.ts --target=bun --outfile=migrate-idempo
 RUN bun build scripts/encrypt-backfill.ts --target=bun --outfile=encrypt-backfill.js
 
 # Bundle auto-process worker (sync + transcribe + summarize every 30 min)
-RUN bun build src/autoprocess.ts --target=bun --outfile=autoprocess.js
+RUN bun build src/autoprocess.ts --target=bun --outfile=autoprocess.js --external bun:sql
 
 # Final runtime image
 FROM base AS runner
