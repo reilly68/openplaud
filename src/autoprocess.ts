@@ -102,9 +102,7 @@ function httpPost(
                         resolve(JSON.parse(raw));
                     } catch {
                         reject(
-                            new Error(
-                                "JSON parse error: " + raw.slice(0, 120),
-                            ),
+                            new Error("JSON parse error: " + raw.slice(0, 120)),
                         );
                     }
                 });

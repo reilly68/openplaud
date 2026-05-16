@@ -81,7 +81,8 @@ export function makeNodeFetch(timeoutMs = TWO_HOURS_MS): typeof fetch {
                 contentType = `multipart/form-data; boundary=${boundary}`;
             } else {
                 bodyBuf = Buffer.from(body as string);
-                contentType = existingHeaders["content-type"] ?? "application/json";
+                contentType =
+                    existingHeaders["content-type"] ?? "application/json";
             }
         }
 
