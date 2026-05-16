@@ -23,7 +23,8 @@ const STARTUP_DELAY_MS = 60 * 1000;
 
 // biome-ignore lint/suspicious/noExplicitAny: Bun.sql global, not in standard TS types
 const sql = (globalThis as any).Bun?.sql as
-    | ((strings: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>)
+    // biome-ignore lint/suspicious/noExplicitAny: intentional any for Bun.sql rows
+    | ((strings: TemplateStringsArray, ...values: any[]) => Promise<any[]>)
     | undefined;
 
 async function getSignedCookie(): Promise<string | null> {
