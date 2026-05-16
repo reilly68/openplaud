@@ -21,53 +21,52 @@ const STARTUP_DELAY_MS = 60 * 1000;
 // Session cookie helper
 // ---------------------------------------------------------------------------
 
+// biome-ignore lint/suspicious/noExplicitAny: Bun.sql global, not in standard TS types
+const sql = (globalThis as any).Bun?.sql as
+    | ((strings: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>)
+    | undefined;
+
 async function getSignedCookie(): Promise<string | null> {
-    // Dynamic import so this file can be compiled standalone by Bun
-    const { default: BunSql } = await import("bun:sql" as string);
-    const db = new BunSql(process.env.DATABASE_URL!);
-    try {
-        const rows = await db`
-            SELECT token, expires_at FROM sessions
-            WHERE expires_at > NOW()
-            ORDER BY expires_at DESC
-            LIMIT 1
+    if (!sql) throw new Error("Bun.sql not available");
+    const rows = await sql`
+        SELECT token, expires_at FROM sessions
+        WHERE expires_at > NOW()
+        ORDER BY expires_at DESC
+        LIMIT 1
+    `;
+    if (!rows.length) return null;
+
+    const token = rows[0].token as string;
+    const secret = process.env.BETTER_AUTH_SECRET!;
+    const key = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+    );
+    const sig = await crypto.subtle.sign(
+        "HMAC",
+        key,
+        new TextEncoder().encode(token),
+    );
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+
+    // Extend session if expiring within 60 days
+    const expiresAt = rows[0].expires_at as Date | null;
+    const daysLeft = expiresAt
+        ? (expiresAt.getTime() - Date.now()) / 86_400_000
+        : 999;
+    if (daysLeft < 60) {
+        await sql`
+            UPDATE sessions
+            SET expires_at = NOW() + INTERVAL '365 days'
+            WHERE token = ${token}
         `;
-        if (!rows.length) return null;
-
-        const token: string = rows[0].token;
-        const secret = process.env.BETTER_AUTH_SECRET!;
-        const key = await crypto.subtle.importKey(
-            "raw",
-            new TextEncoder().encode(secret),
-            { name: "HMAC", hash: "SHA-256" },
-            false,
-            ["sign"],
-        );
-        const sig = await crypto.subtle.sign(
-            "HMAC",
-            key,
-            new TextEncoder().encode(token),
-        );
-        const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
-
-        // Extend session if expiring within 60 days
-        const expiresAt: Date | null = rows[0].expires_at;
-        const daysLeft = expiresAt
-            ? (expiresAt.getTime() - Date.now()) / 86_400_000
-            : 999;
-        if (daysLeft < 60) {
-            await db`
-                UPDATE sessions
-                SET expires_at = NOW() + INTERVAL '365 days'
-                WHERE token = ${token}
-            `;
-            console.log("[autoprocess] Session extended to 365 days");
-        }
-
-        return `better-auth.session_token=${encodeURIComponent(`${token}.${sigB64}`)}`;
-    } finally {
-        await db.end();
+        console.log("[autoprocess] Session extended to 365 days");
     }
+
+    return `better-auth.session_token=${encodeURIComponent(`${token}.${sigB64}`)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +140,7 @@ async function runAutoProcess(): Promise<void> {
         return;
     }
 
-    // Dynamic Bun SQL for queue queries
-    const { default: BunSql } = await import("bun:sql" as string);
-    const db = new BunSql(process.env.DATABASE_URL!);
+    if (!sql) throw new Error("Bun.sql not available");
 
     try {
         // 1. Sync new recordings from Plaud cloud
@@ -164,7 +161,7 @@ async function runAutoProcess(): Promise<void> {
         }
 
         // 2. Transcribe recordings without a transcript
-        const pendingTx = await db`
+        const pendingTx = await sql`
             SELECT r.id, r.duration FROM recordings r
             LEFT JOIN transcriptions t ON t.recording_id = r.id
             WHERE r.deleted_at IS NULL AND t.id IS NULL
@@ -212,7 +209,7 @@ async function runAutoProcess(): Promise<void> {
         }
 
         // 3. Summarize transcribed recordings without a summary
-        const pendingSum = await db`
+        const pendingSum = await sql`
             SELECT r.id FROM recordings r
             JOIN transcriptions t ON t.recording_id = r.id
             LEFT JOIN ai_enhancements a ON a.recording_id = r.id
@@ -256,8 +253,6 @@ async function runAutoProcess(): Promise<void> {
             "[autoprocess] Unexpected error:",
             e instanceof Error ? e.message : e,
         );
-    } finally {
-        await db.end();
     }
 
     console.log("[autoprocess] Done.");
