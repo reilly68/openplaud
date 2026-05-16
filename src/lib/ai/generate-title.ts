@@ -145,7 +145,7 @@ export async function generateTitleFromTranscription(
                 },
             ],
             temperature: 0.7,
-            max_tokens: 5000,
+            max_tokens: 8000,
         });
 
         const message = response.choices[0]?.message as {
