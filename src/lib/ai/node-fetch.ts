@@ -44,7 +44,11 @@ export function makeNodeFetch(timeoutMs = TWO_HOURS_MS): typeof fetch {
         let bodyBuf: Buffer | null = null;
         let contentType: string | undefined;
 
-        const existingHeaders = (init?.headers ?? {}) as Record<string, string>;
+        const rawHeaders = init?.headers ?? {};
+        const existingHeaders: Record<string, string> =
+            rawHeaders instanceof Headers
+                ? Object.fromEntries(rawHeaders.entries())
+                : (rawHeaders as Record<string, string>);
 
         if (init?.body != null) {
             const body = init.body;
