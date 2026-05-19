@@ -85,6 +85,15 @@ describe("issue #101 — buildTranscriptionParams sends chunking_strategy for di
         });
         expect((params as { language?: string }).language).toBeUndefined();
     });
+
+    it("always includes cleanup: 'true' so the Whisper server runs LLM post-processing", () => {
+        const params = buildTranscriptionParams({
+            file: fakeFile,
+            model: "whisper-1",
+            responseFormat: "verbose_json",
+        });
+        expect(params.cleanup).toBe("true");
+    });
 });
 
 // Integration: end-to-end through `transcribeRecording`. Verifies both the
