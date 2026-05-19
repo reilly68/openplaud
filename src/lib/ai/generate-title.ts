@@ -159,7 +159,9 @@ export async function generateTitleFromTranscription(
         if (!title && message?.reasoning) {
             const raw = String(message.reasoning);
             // Look for explicit output marker: [Output Generation] -> <title>
-            const outputMatch = raw.match(/\[Output Generation\]\s*->\s*([^\n\r*]+)/i);
+            const outputMatch = raw.match(
+                /\[Output Generation\]\s*->\s*([^\n\r*]+)/i,
+            );
             if (outputMatch) {
                 title = outputMatch[1].replace(/\*+/g, "").trim();
             }

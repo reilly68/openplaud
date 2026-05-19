@@ -76,7 +76,11 @@ export function buildAudioFile(
     const isOgg = isOggContainer(audioBuffer);
     const isRiff = !isOgg && isRiffContainer(audioBuffer);
 
-    const ext = isOgg ? "ogg" : isRiff ? "wav" : storagePath.split(".").pop()?.toLowerCase() || "mp3";
+    const ext = isOgg
+        ? "ogg"
+        : isRiff
+          ? "wav"
+          : storagePath.split(".").pop()?.toLowerCase() || "mp3";
 
     // Trust magic bytes over path-derived guesses: OGG → audio/ogg,
     // RIFF → audio/wav (covers RIFF-wrapped MP3 and standard WAV),
