@@ -615,7 +615,9 @@ export function RecordingList({
                                                         <DropdownMenuItem
                                                             onSelect={(e) => {
                                                                 e.preventDefault();
-                                                                setEditTarget(recording);
+                                                                setEditTarget(
+                                                                    recording,
+                                                                );
                                                             }}
                                                         >
                                                             <Pencil />
