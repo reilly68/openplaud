@@ -32,6 +32,7 @@ import type { Recording } from "@/types/recording";
 interface TranscriptionData {
     text?: string;
     language?: string;
+    transcriptionType?: string;
 }
 
 interface Provider {
@@ -113,6 +114,13 @@ export function Workstation({
     const [editedOverrides, setEditedOverrides] = useState<
         Map<string, Partial<Recording>>
     >(new Map());
+    // Optimistic manual transcript edits, keyed by recordingId. Layered
+    // on top of the server `transcriptions` prop so the detail pane and
+    // list search reflect an edit immediately. Cleared per-id once the
+    // refreshed server data confirms the new text.
+    const [transcriptionOverrides, setTranscriptionOverrides] = useState<
+        Map<string, string>
+    >(new Map());
     // On <lg viewports the list and detail panes can't coexist -- we
     // toggle between them instead of stacking. Desktop ignores this
     // state entirely (both panes render via the grid).
@@ -134,8 +142,25 @@ export function Workstation({
         });
     }, [recordings, hiddenIds, editedOverrides]);
 
+    // Layer optimistic transcript edits over the server-provided Map so
+    // every consumer (detail pane, list search, command palette) sees a
+    // manual edit before the refetch lands.
+    const effectiveTranscriptions = useMemo(() => {
+        if (transcriptionOverrides.size === 0) return transcriptions;
+        const merged = new Map(transcriptions);
+        for (const [id, text] of transcriptionOverrides) {
+            const prev = merged.get(id);
+            merged.set(id, {
+                ...prev,
+                text,
+                transcriptionType: "manual",
+            });
+        }
+        return merged;
+    }, [transcriptions, transcriptionOverrides]);
+
     const currentTranscription = currentRecording
-        ? transcriptions.get(currentRecording.id)
+        ? effectiveTranscriptions.get(currentRecording.id)
         : undefined;
 
     // Keep currentRecording in sync with the recordings prop (updated
@@ -178,6 +203,20 @@ export function Workstation({
             return next.size === prev.size ? prev : next;
         });
     }, [recordings]);
+
+    // Drop optimistic transcript overrides once the refreshed server Map
+    // carries the same text (page.tsx decrypts before sending, so a plain
+    // string compare is valid).
+    useEffect(() => {
+        setTranscriptionOverrides((prev) => {
+            if (prev.size === 0) return prev;
+            const next = new Map(prev);
+            for (const [id, text] of prev) {
+                if (transcriptions.get(id)?.text === text) next.delete(id);
+            }
+            return next.size === prev.size ? prev : next;
+        });
+    }, [transcriptions]);
 
     const {
         isAutoSyncing,
@@ -321,6 +360,21 @@ export function Workstation({
         [refresh],
     );
 
+    // Apply a saved manual transcript edit (the PATCH already succeeded in
+    // the dialog). Layer it optimistically and refetch so the override can
+    // reconcile away once server data confirms it.
+    const handleTranscriptSaved = useCallback(
+        (recordingId: string, text: string) => {
+            setTranscriptionOverrides((prev) => {
+                const next = new Map(prev);
+                next.set(recordingId, text);
+                return next;
+            });
+            refresh();
+        },
+        [refresh],
+    );
+
     // Keyboard shortcuts (global). Disabled while any modal is open
     // so the modal owns keyboard focus exclusively. The shortcuts
     // dialog itself uses these very keys to navigate its rows.
@@ -386,7 +440,7 @@ export function Workstation({
                                 <RecordingList
                                     ref={listRef}
                                     recordings={visibleRecordings}
-                                    transcriptions={transcriptions}
+                                    transcriptions={effectiveTranscriptions}
                                     currentRecording={currentRecording}
                                     pendingUploads={pendingUploads}
                                     inFlightActions={inFlightActions}
@@ -418,6 +472,7 @@ export function Workstation({
                                 isCurrentTranscribing={isCurrentTranscribing}
                                 visibleRecordings={visibleRecordings}
                                 onTranscribe={handleTranscribe}
+                                onTranscriptSaved={handleTranscriptSaved}
                                 onSelectRecording={setCurrentRecording}
                                 onBackToList={() => setMobileView("list")}
                                 hiddenOnMobile={mobileView === "list"}
@@ -439,7 +494,7 @@ export function Workstation({
                 open={paletteOpen}
                 onOpenChange={setPaletteOpen}
                 recordings={visibleRecordings}
-                transcriptions={transcriptions}
+                transcriptions={effectiveTranscriptions}
                 currentRecording={currentRecording}
                 inFlightActions={inFlightActions}
                 currentTheme={theme}

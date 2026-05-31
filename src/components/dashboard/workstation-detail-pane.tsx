@@ -11,6 +11,7 @@ import type { Recording } from "@/types/recording";
 interface TranscriptionData {
     text?: string;
     language?: string;
+    transcriptionType?: string;
 }
 
 interface Props {
@@ -19,6 +20,7 @@ interface Props {
     isCurrentTranscribing: boolean;
     visibleRecordings: Recording[];
     onTranscribe: () => void;
+    onTranscriptSaved: (recordingId: string, text: string) => void;
     onSelectRecording: (r: Recording) => void;
     onBackToList: () => void;
     /** When true, the pane is hidden (mobile list view active). */
@@ -45,6 +47,7 @@ export function WorkstationDetailPane({
     isCurrentTranscribing,
     visibleRecordings,
     onTranscribe,
+    onTranscriptSaved,
     onSelectRecording,
     onBackToList,
     hiddenOnMobile,
@@ -102,6 +105,9 @@ export function WorkstationDetailPane({
                         transcription={currentTranscription}
                         isTranscribing={isCurrentTranscribing}
                         onTranscribe={onTranscribe}
+                        onTranscriptSaved={(text) =>
+                            onTranscriptSaved(currentRecording.id, text)
+                        }
                     />
                 </>
             ) : (

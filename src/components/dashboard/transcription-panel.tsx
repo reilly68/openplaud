@@ -7,10 +7,14 @@ import {
     Languages,
     ListChecks,
     Loader2,
+    Pencil,
     RefreshCw,
     Sparkles,
     Trash2,
 } from "lucide-react";
+import { useState } from "react";
+import { useConfirm } from "@/components/confirm-dialog";
+import { EditTranscriptionDialog } from "@/components/dashboard/edit-transcription-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -27,6 +31,7 @@ import type { Recording } from "@/types/recording";
 interface Transcription {
     text?: string;
     language?: string;
+    transcriptionType?: string;
 }
 
 interface TranscriptionPanelProps {
@@ -34,6 +39,8 @@ interface TranscriptionPanelProps {
     transcription?: Transcription;
     isTranscribing: boolean;
     onTranscribe: () => void;
+    /** Called after a manual transcript edit is saved (decrypted text). */
+    onTranscriptSaved: (text: string) => void;
 }
 
 export function TranscriptionPanel({
@@ -41,7 +48,10 @@ export function TranscriptionPanel({
     transcription,
     isTranscribing,
     onTranscribe,
+    onTranscriptSaved,
 }: TranscriptionPanelProps) {
+    const confirm = useConfirm();
+    const [editOpen, setEditOpen] = useState(false);
     const {
         summaryData,
         isSummarizing,
@@ -56,6 +66,27 @@ export function TranscriptionPanel({
         transcriptionText: transcription?.text,
     });
 
+    // Whisper re-transcribe overwrites the stored text. If the current
+    // transcript was hand-edited, confirm first so the user doesn't
+    // silently lose their corrections.
+    const handleReTranscribe = () => {
+        if (transcription?.transcriptionType === "manual") {
+            void confirm({
+                title: "Re-transcribe with Whisper?",
+                description: (
+                    <>
+                        This transcript was manually edited. Re-transcribing
+                        re-runs Whisper and <b>discards your manual edits</b>.
+                    </>
+                ),
+                confirmLabel: "Re-transcribe",
+                onConfirm: () => onTranscribe(),
+            });
+            return;
+        }
+        onTranscribe();
+    };
+
     return (
         <div className="space-y-4">
             {/* Transcription Card */}
@@ -68,15 +99,26 @@ export function TranscriptionPanel({
                         </CardTitle>
                         <div className="flex items-center gap-2">
                             {transcription?.text && (
-                                <Button
-                                    onClick={onTranscribe}
-                                    size="sm"
-                                    variant="outline"
-                                    disabled={isTranscribing}
-                                >
-                                    <RefreshCw className="size-4 mr-2" />
-                                    Re-transcribe
-                                </Button>
+                                <>
+                                    <Button
+                                        onClick={() => setEditOpen(true)}
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={isTranscribing}
+                                    >
+                                        <Pencil className="size-4 mr-2" />
+                                        Edit
+                                    </Button>
+                                    <Button
+                                        onClick={handleReTranscribe}
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={isTranscribing}
+                                    >
+                                        <RefreshCw className="size-4 mr-2" />
+                                        Re-transcribe
+                                    </Button>
+                                </>
                             )}
                             {!transcription?.text && !isTranscribing && (
                                 <Button
@@ -331,6 +373,21 @@ export function TranscriptionPanel({
                         )}
                     </CardContent>
                 </Card>
+            )}
+
+            {transcription?.text && (
+                <EditTranscriptionDialog
+                    recordingId={recording.id}
+                    initialText={transcription.text}
+                    open={editOpen}
+                    onOpenChange={setEditOpen}
+                    onSaved={(text) => {
+                        // Propagate the edit up for immediate display, then
+                        // regenerate the summary from the corrected text.
+                        onTranscriptSaved(text);
+                        void handleSummarize();
+                    }}
+                />
             )}
         </div>
     );
