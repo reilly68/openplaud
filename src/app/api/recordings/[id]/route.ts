@@ -96,7 +96,7 @@ export const PATCH = apiHandler<IdContext>(async (request, context) => {
 
     if (body.startTime !== undefined) {
         const d = new Date(body.startTime as string);
-        if (isNaN(d.getTime())) {
+        if (Number.isNaN(d.getTime())) {
             throw new AppError(
                 ErrorCode.INVALID_INPUT,
                 "startTime must be a valid ISO datetime",

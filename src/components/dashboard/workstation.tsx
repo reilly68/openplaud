@@ -168,7 +168,8 @@ export function Workstation({
                 const patch = next.get(r.id);
                 if (!patch) continue;
                 const filenameMatches =
-                    patch.filename === undefined || patch.filename === r.filename;
+                    patch.filename === undefined ||
+                    patch.filename === r.filename;
                 const startTimeMatches =
                     patch.startTime === undefined ||
                     patch.startTime === r.startTime;

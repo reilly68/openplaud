@@ -288,7 +288,6 @@ export function RecordingList({
     const rowPadding = isCompact ? "px-4 py-2" : "px-4 py-3";
 
     return (
-        <>
         <Card hasNoPadding>
             <CardContent className="p-0">
                 {/* Header: search + sort + density */}
@@ -735,23 +734,22 @@ export function RecordingList({
 
                     {/* Infinite-scroll sentinel */}
                     <div ref={sentinelRef} className="h-4" aria-hidden="true" />
+
+                    {editTarget && (
+                        <EditRecordingDialog
+                            recording={editTarget}
+                            open={editTarget !== null}
+                            onOpenChange={(o) => {
+                                if (!o) setEditTarget(null);
+                            }}
+                            onSaved={(updated) => {
+                                onEdited(updated);
+                                setEditTarget(null);
+                            }}
+                        />
+                    )}
                 </div>
             </CardContent>
         </Card>
-
-        {editTarget && (
-            <EditRecordingDialog
-                recording={editTarget}
-                open={editTarget !== null}
-                onOpenChange={(o) => {
-                    if (!o) setEditTarget(null);
-                }}
-                onSaved={(updated) => {
-                    onEdited(updated);
-                    setEditTarget(null);
-                }}
-            />
-        )}
-        </>
     );
 }

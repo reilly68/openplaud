@@ -17,7 +17,9 @@ interface EditRecordingDialogProps {
     recording: Recording;
     open: boolean;
     onOpenChange: (open: boolean) => void;
-    onSaved: (updated: Pick<Recording, "id" | "filename" | "startTime">) => void;
+    onSaved: (
+        updated: Pick<Recording, "id" | "filename" | "startTime">,
+    ) => void;
 }
 
 export function EditRecordingDialog({
@@ -91,9 +93,7 @@ export function EditRecordingDialog({
             });
             onOpenChange(false);
         } catch (err) {
-            toast.error(
-                err instanceof Error ? err.message : "Failed to save",
-            );
+            toast.error(err instanceof Error ? err.message : "Failed to save");
         } finally {
             setIsLoading(false);
         }
