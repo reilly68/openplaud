@@ -8,7 +8,7 @@ import {
     webhookDeliveries,
 } from "@/db/schema";
 import { requireApiSession } from "@/lib/auth-server";
-import { decryptText } from "@/lib/encryption/fields";
+import { decryptText, encryptText } from "@/lib/encryption/fields";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 import { emitEvent } from "@/lib/webhooks/emit";
@@ -67,6 +67,72 @@ export const GET = apiHandler<IdContext>(async (request, context) => {
         transcription: transcription
             ? { ...transcription, text: decryptText(transcription.text) }
             : null,
+    });
+});
+
+export const PATCH = apiHandler<IdContext>(async (request, context) => {
+    const session = await requireApiSession(request);
+    const { id } = await (context as IdContext).params;
+    const body = (await request.json().catch(() => ({}))) as Record<
+        string,
+        unknown
+    >;
+
+    const updates: Partial<typeof recordings.$inferInsert> = {
+        updatedAt: new Date(),
+    };
+
+    if (body.filename !== undefined) {
+        if (typeof body.filename !== "string" || !body.filename.trim()) {
+            throw new AppError(
+                ErrorCode.INVALID_INPUT,
+                "filename must be a non-empty string",
+                400,
+                { field: "filename" },
+            );
+        }
+        updates.filename = encryptText(body.filename.trim());
+    }
+
+    if (body.startTime !== undefined) {
+        const d = new Date(body.startTime as string);
+        if (isNaN(d.getTime())) {
+            throw new AppError(
+                ErrorCode.INVALID_INPUT,
+                "startTime must be a valid ISO datetime",
+                400,
+                { field: "startTime" },
+            );
+        }
+        updates.startTime = d;
+    }
+
+    const [rec] = await db
+        .update(recordings)
+        .set(updates)
+        .where(
+            and(
+                eq(recordings.id, id),
+                eq(recordings.userId, session.user.id),
+                isNull(recordings.deletedAt),
+            ),
+        )
+        .returning();
+
+    if (!rec) {
+        throw new AppError(
+            ErrorCode.RECORDING_NOT_FOUND,
+            "Recording not found",
+            404,
+            { id },
+        );
+    }
+
+    return NextResponse.json({
+        recording: {
+            ...rec,
+            filename: decryptText(rec.filename),
+        },
     });
 });
 
