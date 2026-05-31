@@ -106,6 +106,13 @@ export function Workstation({
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [shortcutsOpen, setShortcutsOpen] = useState(false);
     const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
+    // Optimistic metadata edits (filename / startTime), keyed by id.
+    // Applied on top of the server `recordings` prop so the list, detail
+    // pane, and command palette all reflect an edit immediately. Cleared
+    // per-id once the refreshed server data confirms the change.
+    const [editedOverrides, setEditedOverrides] = useState<
+        Map<string, Partial<Recording>>
+    >(new Map());
     // On <lg viewports the list and detail panes can't coexist -- we
     // toggle between them instead of stacking. Desktop ignores this
     // state entirely (both panes render via the grid).
@@ -115,11 +122,17 @@ export function Workstation({
     const { theme, setTheme } = useTheme(initialSettings.theme);
     const listRef = useRef<RecordingListHandle>(null);
 
-    // Filter out optimistically-hidden (deleted) rows.
-    const visibleRecordings = useMemo(
-        () => recordings.filter((r) => !hiddenIds.has(r.id)),
-        [recordings, hiddenIds],
-    );
+    // Filter out optimistically-hidden (deleted) rows, then layer on any
+    // optimistic metadata edits so every consumer (list, detail pane,
+    // command palette) sees the edit before the server refetch lands.
+    const visibleRecordings = useMemo(() => {
+        const base = recordings.filter((r) => !hiddenIds.has(r.id));
+        if (editedOverrides.size === 0) return base;
+        return base.map((r) => {
+            const patch = editedOverrides.get(r.id);
+            return patch ? { ...r, ...patch } : r;
+        });
+    }, [recordings, hiddenIds, editedOverrides]);
 
     const currentTranscription = currentRecording
         ? transcriptions.get(currentRecording.id)
@@ -142,6 +155,24 @@ export function Workstation({
             const ids = new Set(recordings.map((r) => r.id));
             for (const id of prev) {
                 if (ids.has(id)) next.add(id); // still present -> keep hidden until confirmed
+            }
+            return next.size === prev.size ? prev : next;
+        });
+        // Drop optimistic edit overrides once the refreshed server row
+        // matches them (filename is decrypted server-side, startTime is an
+        // ISO string -- both directly comparable to what we stored).
+        setEditedOverrides((prev) => {
+            if (prev.size === 0) return prev;
+            const next = new Map(prev);
+            for (const r of recordings) {
+                const patch = next.get(r.id);
+                if (!patch) continue;
+                const filenameMatches =
+                    patch.filename === undefined || patch.filename === r.filename;
+                const startTimeMatches =
+                    patch.startTime === undefined ||
+                    patch.startTime === r.startTime;
+                if (filenameMatches && startTimeMatches) next.delete(r.id);
             }
             return next.size === prev.size ? prev : next;
         });
@@ -267,6 +298,28 @@ export function Workstation({
         [currentRecording, visibleRecordings, refresh],
     );
 
+    // Apply a confirmed metadata edit (the PATCH already succeeded inside
+    // the dialog). Optimistically layer it over the server data for the
+    // list/detail/palette, update the open recording if it's the one
+    // edited, then refetch so the override can reconcile away.
+    const handleEdited = useCallback(
+        (updated: Pick<Recording, "id" | "filename" | "startTime">) => {
+            setEditedOverrides((prev) => {
+                const next = new Map(prev);
+                next.set(updated.id, {
+                    filename: updated.filename,
+                    startTime: updated.startTime,
+                });
+                return next;
+            });
+            setCurrentRecording((prev) =>
+                prev && prev.id === updated.id ? { ...prev, ...updated } : prev,
+            );
+            refresh();
+        },
+        [refresh],
+    );
+
     // Keyboard shortcuts (global). Disabled while any modal is open
     // so the modal owns keyboard focus exclusively. The shortcuts
     // dialog itself uses these very keys to navigate its rows.
@@ -344,6 +397,7 @@ export function Workstation({
                                         setMobileView("detail");
                                     }}
                                     onDelete={handleDelete}
+                                    onEdited={handleEdited}
                                     initialDateTimeFormat={
                                         initialSettings.dateTimeFormat
                                     }

@@ -28,6 +28,11 @@ export function EditRecordingDialog({
 }: EditRecordingDialogProps) {
     const [filename, setFilename] = useState("");
     const [startTime, setStartTime] = useState("");
+    // The datetime-local value we pre-filled with. We only send startTime
+    // back if the user actually changed it -- otherwise the input's
+    // minute-granularity would silently truncate the recording's seconds
+    // on an unrelated (filename-only) save.
+    const [initialStartTime, setInitialStartTime] = useState("");
     const [isLoading, setIsLoading] = useState(false);
 
     useEffect(() => {
@@ -39,6 +44,7 @@ export function EditRecordingDialog({
                 .toISOString()
                 .slice(0, 16);
             setStartTime(local);
+            setInitialStartTime(local);
         }
     }, [open, recording]);
 
@@ -46,32 +52,38 @@ export function EditRecordingDialog({
         e.preventDefault();
 
         if (!filename.trim()) {
-            toast.error("Název nemůže být prázdný");
+            toast.error("Name cannot be empty");
             return;
         }
 
         setIsLoading(true);
         try {
+            const body: { filename: string; startTime?: string } = {
+                filename: filename.trim(),
+            };
+            // Only send startTime if the user changed the field, so a
+            // filename-only edit never truncates the original seconds.
+            if (startTime !== initialStartTime) {
+                body.startTime = new Date(startTime).toISOString();
+            }
+
             const response = await fetch(`/api/recordings/${recording.id}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    filename: filename.trim(),
-                    startTime: new Date(startTime).toISOString(),
-                }),
+                body: JSON.stringify(body),
             });
 
             if (!response.ok) {
                 const err = await response.json().catch(() => ({}));
                 throw new Error(
-                    (err as { error?: string }).error ?? "Uložení selhalo",
+                    (err as { error?: string }).error ?? "Failed to save",
                 );
             }
 
             const data = (await response.json()) as {
                 recording: Recording;
             };
-            toast.success("Nahrávka uložena");
+            toast.success("Recording updated");
             onSaved({
                 id: data.recording.id,
                 filename: data.recording.filename,
@@ -80,7 +92,7 @@ export function EditRecordingDialog({
             onOpenChange(false);
         } catch (err) {
             toast.error(
-                err instanceof Error ? err.message : "Uložení selhalo",
+                err instanceof Error ? err.message : "Failed to save",
             );
         } finally {
             setIsLoading(false);
@@ -93,12 +105,12 @@ export function EditRecordingDialog({
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="max-w-sm">
                 <DialogHeader>
-                    <DialogTitle>Upravit nahrávku</DialogTitle>
+                    <DialogTitle>Edit recording</DialogTitle>
                 </DialogHeader>
 
                 <form onSubmit={handleSubmit} className="space-y-4">
                     <div className="space-y-2">
-                        <Label htmlFor="edit-filename">Název</Label>
+                        <Label htmlFor="edit-filename">Name</Label>
                         <Input
                             id="edit-filename"
                             type="text"
@@ -110,7 +122,7 @@ export function EditRecordingDialog({
                     </div>
 
                     <div className="space-y-2">
-                        <Label htmlFor="edit-starttime">Datum a čas</Label>
+                        <Label htmlFor="edit-starttime">Date &amp; time</Label>
                         <Input
                             id="edit-starttime"
                             type="datetime-local"
@@ -127,14 +139,14 @@ export function EditRecordingDialog({
                             disabled={isLoading}
                             className="flex-1"
                         >
-                            Zrušit
+                            Cancel
                         </MetalButton>
                         <MetalButton
                             type="submit"
                             disabled={isLoading}
                             className="flex-1"
                         >
-                            {isLoading ? "Ukládám…" : "Uložit"}
+                            {isLoading ? "Saving…" : "Save"}
                         </MetalButton>
                     </div>
                 </form>

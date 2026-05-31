@@ -64,6 +64,9 @@ interface RecordingListProps {
     inFlightActions: Map<string, "transcribing" | "summarizing">;
     onSelect: (recording: Recording) => void;
     onDelete: (recording: Recording) => Promise<void>;
+    onEdited: (
+        updated: Pick<Recording, "id" | "filename" | "startTime">,
+    ) => void;
     initialDateTimeFormat: DateTimeFormat;
     initialSortOrder: SortOrder;
     initialDensity: ListDensity;
@@ -126,6 +129,7 @@ export function RecordingList({
     inFlightActions,
     onSelect,
     onDelete,
+    onEdited,
     initialDateTimeFormat,
     initialSortOrder,
     initialDensity,
@@ -138,7 +142,6 @@ export function RecordingList({
     const [query, setQuery] = useState("");
     const [visibleCount, setVisibleCount] = useState(initialChunkSize);
     const [editTarget, setEditTarget] = useState<Recording | null>(null);
-    const [recordingOverrides, setRecordingOverrides] = useState<Map<string, Partial<Recording>>>(new Map());
     const confirm = useConfirm();
     const searchRef = useRef<HTMLInputElement>(null);
     const sentinelRef = useRef<HTMLDivElement>(null);
@@ -154,28 +157,16 @@ export function RecordingList({
         persistSetting("listDensity", next);
     }, []);
 
-    // Merge server-confirmed edits into the prop array (prop is read-only).
-    const effectiveRecordings = useMemo(
-        () =>
-            recordingOverrides.size === 0
-                ? recordings
-                : recordings.map((r) => {
-                      const patch = recordingOverrides.get(r.id);
-                      return patch ? { ...r, ...patch } : r;
-                  }),
-        [recordings, recordingOverrides],
-    );
-
     // Filter (filename + transcript text), then sort.
     const filtered = useMemo(() => {
         const q = query.trim().toLowerCase();
         const base = q
-            ? effectiveRecordings.filter((r) => {
+            ? recordings.filter((r) => {
                   if (r.filename.toLowerCase().includes(q)) return true;
                   const t = transcriptions.get(r.id);
                   return !!t?.text && t.text.toLowerCase().includes(q);
               })
-            : effectiveRecordings;
+            : recordings;
 
         const sorted = [...base];
         switch (sortOrder) {
@@ -198,7 +189,7 @@ export function RecordingList({
                 break;
         }
         return sorted;
-    }, [effectiveRecordings, transcriptions, query, sortOrder]);
+    }, [recordings, transcriptions, query, sortOrder]);
 
     const visible = filtered.slice(0, visibleCount);
 
@@ -752,13 +743,11 @@ export function RecordingList({
             <EditRecordingDialog
                 recording={editTarget}
                 open={editTarget !== null}
-                onOpenChange={(o) => { if (!o) setEditTarget(null); }}
+                onOpenChange={(o) => {
+                    if (!o) setEditTarget(null);
+                }}
                 onSaved={(updated) => {
-                    setRecordingOverrides((prev) => {
-                        const next = new Map(prev);
-                        next.set(updated.id, { filename: updated.filename, startTime: updated.startTime });
-                        return next;
-                    });
+                    onEdited(updated);
                     setEditTarget(null);
                 }}
             />
