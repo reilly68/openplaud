@@ -21,6 +21,30 @@ export function getResponseFormat(model: string): ResponseFormat {
 }
 
 /**
+ * Strip leaked "cleanup" LLM meta-commentary from a transcript.
+ *
+ * The upstream transcription server runs an LLM cleanup pass (we send
+ * `cleanup: "true"`). It occasionally emits a self-describing preamble
+ * ("Zde je vyčištěný přepis… odstraněny halucinace…" / "Here is the
+ * cleaned transcript…") followed by a `***` separator before the actual
+ * cleaned text. Because long audio is chunked and the chunks are
+ * concatenated, that block can land mid-transcript.
+ *
+ * We remove it defensively, anchored on the cleanup self-reference plus
+ * the `***` delimiter so legitimate content is left untouched. The real
+ * fix lives in the transcription server's cleanup prompt; this is a
+ * belt-and-suspenders guard against a nondeterministic LLM regressing.
+ */
+export function stripCleanupArtifacts(text: string): string {
+    return text
+        .replace(
+            /[^\n]*(?:vyčištěn\w*\s+přepis|cleaned\s+transcript)[\s\S]*?\n\s*\*{3,}\s*\n+/gi,
+            "",
+        )
+        .trim();
+}
+
+/**
  * Normalise the transcription response from any supported format into a
  * simple `{ text, detectedLanguage }` pair.
  */
@@ -33,13 +57,13 @@ export function parseTranscriptionResponse(
         const text = (diarized.segments ?? [])
             .map((seg) => `${seg.speaker}: ${seg.text}`)
             .join("\n");
-        return { text, detectedLanguage: null };
+        return { text: stripCleanupArtifacts(text), detectedLanguage: null };
     }
 
     if (responseFormat === "verbose_json") {
         const verbose = transcription as TranscriptionVerbose;
         return {
-            text: verbose.text,
+            text: stripCleanupArtifacts(verbose.text),
             detectedLanguage: verbose.language ?? null,
         };
     }
@@ -48,7 +72,7 @@ export function parseTranscriptionResponse(
     const plain = transcription as { text?: string };
     const text =
         typeof transcription === "string" ? transcription : (plain.text ?? "");
-    return { text, detectedLanguage: null };
+    return { text: stripCleanupArtifacts(text), detectedLanguage: null };
 }
 
 /**
