@@ -263,15 +263,35 @@ async function runAutoProcess(): Promise<void> {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-setTimeout(() => {
-    runAutoProcess().catch((e) =>
-        console.log("[autoprocess] Fatal:", e.message),
-    );
-    setInterval(() => {
-        runAutoProcess().catch((e) =>
-            console.log("[autoprocess] Fatal:", e.message),
+// Re-entrancy guard: a run can overrun the 30-min interval (long
+// recordings take longer to transcribe than the tick spacing). Without
+// this, setInterval would start a second/third runAutoProcess while the
+// first is still awaiting a transcribe, and each would re-select the
+// same not-yet-transcribed recording as "pending" — spawning duplicate
+// concurrent transcribes and Whisper GPU contention (500s). The guard
+// makes overlapping runs no-op; the next tick picks up the remaining work.
+let running = false;
+
+async function tick(): Promise<void> {
+    if (running) {
+        console.log(
+            "[autoprocess] Previous run still in progress — skipping tick.",
         );
-    }, WORKER_INTERVAL_MS);
+        return;
+    }
+    running = true;
+    try {
+        await runAutoProcess();
+    } catch (e) {
+        console.log("[autoprocess] Fatal:", e instanceof Error ? e.message : e);
+    } finally {
+        running = false;
+    }
+}
+
+setTimeout(() => {
+    tick();
+    setInterval(tick, WORKER_INTERVAL_MS);
 }, STARTUP_DELAY_MS);
 
 console.log("[autoprocess] Scheduled (start in 60s, interval 30min).");
