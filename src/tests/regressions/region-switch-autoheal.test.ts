@@ -113,9 +113,7 @@ describe("PlaudClient region-switch auto-heal", () => {
 
         // The replayed request went to the new base with the fresh WT.
         const lastCall = mockFetch.mock.calls.at(-1);
-        expect(String(lastCall?.[0])).toContain(
-            `${NEW_BASE}/file/simple/web`,
-        );
+        expect(String(lastCall?.[0])).toContain(`${NEW_BASE}/file/simple/web`);
         expect(lastCall?.[1]?.headers?.Authorization).toBe("Bearer WT-new");
     });
 

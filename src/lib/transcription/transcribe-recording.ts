@@ -361,8 +361,7 @@ export async function transcribeRecording(
                                 const workspaceChanged =
                                     !!resolved &&
                                     resolved !== connection.workspaceId;
-                                const resolvedBase =
-                                    plaudClient.currentApiBase;
+                                const resolvedBase = plaudClient.currentApiBase;
                                 const apiBaseChanged =
                                     resolvedBase !== connection.apiBase;
                                 if (workspaceChanged || apiBaseChanged) {
