@@ -480,13 +480,25 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
         }
 
         // Update last sync time, plus the workspaceId if it was resolved or
-        // changed during this run (cache-empty backfill or stale-cache rescue).
+        // changed during this run (cache-empty backfill or stale-cache rescue)
+        // and the apiBase if Plaud issued a -302 regional redirect (account
+        // migrated to another regional server). Without persisting the new
+        // base, every future sync would re-discover the region through an
+        // extra failing round-trip against the stale one.
         // Always scope user-owned UPDATEs by userId in addition to the
         // primary key, per AGENTS.md "User-Scoped Queries" rule.
         const resolvedWorkspaceId = plaudClient.workspaceId;
         const workspaceIdChanged =
             !!resolvedWorkspaceId &&
             resolvedWorkspaceId !== connection.workspaceId;
+        const resolvedApiBase = plaudClient.currentApiBase;
+        const apiBaseChanged = resolvedApiBase !== connection.apiBase;
+        if (apiBaseChanged) {
+            console.warn(
+                `[sync] Plaud region migrated: ${connection.apiBase} ->`,
+                `${resolvedApiBase}; persisting to plaud_connections`,
+            );
+        }
         await db
             .update(plaudConnections)
             .set({
@@ -494,6 +506,7 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                 ...(workspaceIdChanged
                     ? { workspaceId: resolvedWorkspaceId }
                     : {}),
+                ...(apiBaseChanged ? { apiBase: resolvedApiBase } : {}),
             })
             .where(
                 and(

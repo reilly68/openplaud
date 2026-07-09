@@ -48,6 +48,7 @@ until curl -sf -o /dev/null http://127.0.0.1:3010/; do sleep 3; done
 - **Cleanup-artifact strip** — `stripCleanupArtifacts()` v `src/lib/transcription/format.ts`, v `parseTranscriptionResponse` (choke point). Odstavcový, NE `***`-bridging. Test `src/tests/regressions/cleanup-artifact-strip.test.ts`.
 - **generate-title** — `POST /api/recordings/[id]/generate-title` (české titulky, max_tokens 8000 pro qwen thinking).
 - **Compose override** HOSTNAME=0.0.0.0 (jinak Next.js bindoval container IP → ECONNREFUSED), Bun.sql global v autoprocess, RIFF magic-byte contentType fix.
+- **Plaud region auto-heal** — `PlaudClient` následuje business `-302` („region switch required" / „user region mismatch") na libovolném endpointu: validuje `data.domains.api` proti plaud.ai allowlistu, resetuje WT stav, retryne na nové bázi (guard `MAX_REGION_REDIRECTS`); `client.currentApiBase` persistuje sync i transcribe path do `plaud_connections.api_base`. Motivace: Plaud 2026-06 přesunul účet global→EU a sync 9 dní tiše hlásil „0 new recordings". Test `src/tests/regressions/region-switch-autoheal.test.ts`.
 
 ## Konvence a záludnosti
 
