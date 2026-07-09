@@ -352,17 +352,30 @@ export async function transcribeRecording(
                                     recording.plaudFileId,
                                     generatedTitle,
                                 );
-                                // Backfill workspaceId if newly resolved.
+                                // Backfill workspaceId if newly resolved,
+                                // and apiBase if Plaud issued a -302
+                                // regional redirect during the call.
                                 // Always scope user-owned UPDATEs by userId
                                 // even when filtering by id (per AGENTS.md).
                                 const resolved = plaudClient.workspaceId;
-                                if (
-                                    resolved &&
-                                    resolved !== connection.workspaceId
-                                ) {
+                                const workspaceChanged =
+                                    !!resolved &&
+                                    resolved !== connection.workspaceId;
+                                const resolvedBase =
+                                    plaudClient.currentApiBase;
+                                const apiBaseChanged =
+                                    resolvedBase !== connection.apiBase;
+                                if (workspaceChanged || apiBaseChanged) {
                                     await db
                                         .update(plaudConnections)
-                                        .set({ workspaceId: resolved })
+                                        .set({
+                                            ...(workspaceChanged
+                                                ? { workspaceId: resolved }
+                                                : {}),
+                                            ...(apiBaseChanged
+                                                ? { apiBase: resolvedBase }
+                                                : {}),
+                                        })
                                         .where(
                                             and(
                                                 eq(

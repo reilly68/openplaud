@@ -7,7 +7,12 @@ import type {
 } from "@/types/plaud";
 import { plaudFetch } from "./fetch";
 import { safeParseJson } from "./parse";
-import { DEFAULT_SERVER_KEY, PLAUD_SERVERS, PLAUD_USER_AGENT } from "./servers";
+import {
+    DEFAULT_SERVER_KEY,
+    isValidPlaudApiUrl,
+    PLAUD_SERVERS,
+    PLAUD_USER_AGENT,
+} from "./servers";
 import { resolveWorkspaceToken } from "./workspace";
 
 export interface PlaudUpdateFilenameResponse {
@@ -19,6 +24,31 @@ export interface PlaudUpdateFilenameResponse {
 export const DEFAULT_PLAUD_API_BASE = PLAUD_SERVERS[DEFAULT_SERVER_KEY].apiBase;
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY = 1000; // 1 second
+/** Per-client-instance cap on -302 regional redirects (ping-pong guard). */
+const MAX_REGION_REDIRECTS = 3;
+
+/**
+ * Business-level regional-redirect envelope. Plaud returns HTTP 200 with
+ * `status: -302` ("region switch required" / "user region mismatch") when
+ * the account lives on a different regional server than the one we called —
+ * including accounts *migrated* between regions after connect (observed
+ * 2026-06: global → EU). The correct API base is advertised at
+ * `data.domains.api`, the same shape the OTP send-code flow follows in
+ * ./auth.ts.
+ */
+interface PlaudRegionRedirect {
+    status: number;
+    msg?: string;
+    data?: { domains?: { api?: string } };
+}
+
+function isPlaudRegionRedirect(body: unknown): body is PlaudRegionRedirect {
+    return (
+        typeof body === "object" &&
+        body !== null &&
+        (body as { status?: unknown }).status === -302
+    );
+}
 
 /**
  * Sleep for specified milliseconds
@@ -83,11 +113,12 @@ function plaudHttpError(status: number, msg: string): AppError {
  */
 export class PlaudClient {
     private readonly userToken: string;
-    private readonly apiBase: string;
+    private apiBase: string;
     private workspaceToken?: string;
     private resolvedWorkspaceId?: string;
     private workspaceFetchInFlight?: Promise<void>;
     private workspaceFallbackToUt = false;
+    private regionRedirects = 0;
 
     constructor(
         userToken: string,
@@ -107,6 +138,17 @@ export class PlaudClient {
      */
     get workspaceId(): string | undefined {
         return this.resolvedWorkspaceId;
+    }
+
+    /**
+     * The API base this client is currently talking to. Starts as the
+     * constructor value and changes when Plaud answers with a `-302`
+     * regional redirect (account migrated to another regional server).
+     * Callers persist this back to `plaud_connections.api_base` when it
+     * differs from what they passed in — same contract as `workspaceId`.
+     */
+    get currentApiBase(): string {
+        return this.apiBase;
     }
 
     /**
@@ -225,7 +267,22 @@ export class PlaudClient {
             // `SyntaxError` and map it to `PLAUD_UPSTREAM_ERROR` anyway,
             // but `safeParseJson` produces the correct code+message in
             // one step and includes a body snippet in `details`.
-            return await safeParseJson<T>(response);
+            const body = await safeParseJson<T>(response);
+
+            // Business-level regional redirect: HTTP 200 whose payload is
+            // `{status: -302}`. Without handling it, recording endpoints
+            // "succeed" with empty payloads and sync silently reports
+            // 0 new recordings forever after Plaud migrates the account.
+            if (isPlaudRegionRedirect(body)) {
+                return await this.followRegionRedirect<T>(
+                    body,
+                    endpoint,
+                    options,
+                    retryCount,
+                );
+            }
+
+            return body;
         } catch (error) {
             if (
                 error instanceof TypeError &&
@@ -250,6 +307,63 @@ export class PlaudClient {
                 502,
             );
         }
+    }
+
+    /**
+     * Handle a business-level `-302` regional redirect on an authenticated
+     * endpoint.
+     *
+     * Plaud migrates accounts between regional servers (observed 2026-06:
+     * global → EU). After a migration the old server keeps answering
+     * HTTP 200 but every payload is `{status: -302, msg: "user region
+     * mismatch"}` — and because the workspace-token mint fails the same
+     * way, the client silently falls back to the UT and sync reports
+     * "0 new recordings" with no error.
+     *
+     * Recovery: validate the advertised base against the plaud.ai
+     * allowlist (it feeds URLs we fetch — SSRF surface), reset the
+     * workspace-token state (a WT minted on the old server is useless on
+     * the new one, and the UT-fallback decision must be re-evaluated),
+     * then replay the request against the new base. `regionRedirects` is
+     * a per-instance cap so two servers pointing at each other can't
+     * bounce us forever.
+     */
+    private async followRegionRedirect<T>(
+        body: PlaudRegionRedirect,
+        endpoint: string,
+        options?: RequestInit,
+        retryCount = 0,
+    ): Promise<T> {
+        const advertised = body.data?.domains?.api?.replace(/\/+$/, "");
+        if (!advertised || !isValidPlaudApiUrl(advertised)) {
+            // A -302 without a usable target is still a hard failure of
+            // this request. Surfacing it beats returning the envelope to
+            // a caller that would misread it as an empty result set.
+            throw new AppError(
+                ErrorCode.PLAUD_API_ERROR,
+                body.msg || "Plaud requires a region switch",
+                400,
+                { plaudStatus: body.status },
+            );
+        }
+        this.regionRedirects += 1;
+        if (this.regionRedirects > MAX_REGION_REDIRECTS) {
+            throw new AppError(
+                ErrorCode.PLAUD_REGION_REDIRECT_LOOP,
+                "Too many region redirects from Plaud. Please try again later.",
+                502,
+            );
+        }
+        console.warn(
+            `[plaud] region switch required: ${this.apiBase} -> ${advertised};`,
+            `retrying ${endpoint}`,
+        );
+        this.apiBase = advertised;
+        // Force a fresh WT mint against the new base — the old WT (or the
+        // UT-fallback decision) belongs to the previous server.
+        this.workspaceToken = undefined;
+        this.workspaceFallbackToUt = false;
+        return this.request<T>(endpoint, options, retryCount);
     }
 
     /**
