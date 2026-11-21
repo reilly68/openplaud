@@ -10,6 +10,10 @@ import {
 import { requireApiSession } from "@/lib/auth-server";
 import { decryptText, encryptText } from "@/lib/encryption/fields";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
+import {
+    MAX_RECORDING_TITLE_LENGTH,
+    normalizeRecordingTitle,
+} from "@/lib/recordings/filename";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 import { emitEvent } from "@/lib/webhooks/emit";
 import { createRedactedWebhookPayload } from "@/lib/webhooks/payload";
@@ -73,29 +77,58 @@ export const GET = apiHandler<IdContext>(async (request, context) => {
 export const PATCH = apiHandler<IdContext>(async (request, context) => {
     const session = await requireApiSession(request);
     const { id } = await (context as IdContext).params;
-    const body = (await request.json().catch(() => ({}))) as Record<
-        string,
-        unknown
-    >;
+    const body = (await request.json().catch(() => ({}))) as unknown;
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        throw new AppError(ErrorCode.INVALID_INPUT, "Invalid body", 400);
+    }
+    const input = body as { filename?: unknown; startTime?: unknown };
+    if (input.filename === undefined && input.startTime === undefined) {
+        throw new AppError(
+            ErrorCode.INVALID_INPUT,
+            "filename or startTime is required",
+            400,
+        );
+    }
 
     const updates: Partial<typeof recordings.$inferInsert> = {
         updatedAt: new Date(),
     };
 
-    if (body.filename !== undefined) {
-        if (typeof body.filename !== "string" || !body.filename.trim()) {
+    if (input.filename !== undefined) {
+        if (typeof input.filename !== "string") {
             throw new AppError(
                 ErrorCode.INVALID_INPUT,
-                "filename must be a non-empty string",
+                "filename must be a string",
                 400,
                 { field: "filename" },
             );
         }
-        updates.filename = encryptText(body.filename.trim());
+        const filename = normalizeRecordingTitle(input.filename);
+        if (!filename) {
+            throw new AppError(
+                ErrorCode.INVALID_INPUT,
+                "Name cannot be empty",
+                400,
+                { field: "filename" },
+            );
+        }
+        if (filename.length > MAX_RECORDING_TITLE_LENGTH) {
+            throw new AppError(
+                ErrorCode.INVALID_INPUT,
+                `Name must be ${MAX_RECORDING_TITLE_LENGTH} characters or fewer`,
+                400,
+                { field: "filename", maxLength: MAX_RECORDING_TITLE_LENGTH },
+            );
+        }
+        updates.filename = encryptText(filename);
     }
 
-    if (body.startTime !== undefined) {
-        const d = new Date(body.startTime as string);
+    // Fork: startTime is editable from the recording metadata dialog.
+    if (input.startTime !== undefined) {
+        const d =
+            typeof input.startTime === "string"
+                ? new Date(input.startTime)
+                : new Date(Number.NaN);
         if (Number.isNaN(d.getTime())) {
             throw new AppError(
                 ErrorCode.INVALID_INPUT,
@@ -107,7 +140,7 @@ export const PATCH = apiHandler<IdContext>(async (request, context) => {
         updates.startTime = d;
     }
 
-    const [rec] = await db
+    const [updated] = await db
         .update(recordings)
         .set(updates)
         .where(
@@ -119,20 +152,23 @@ export const PATCH = apiHandler<IdContext>(async (request, context) => {
         )
         .returning();
 
-    if (!rec) {
+    if (!updated) {
         throw new AppError(
             ErrorCode.RECORDING_NOT_FOUND,
             "Recording not found",
             404,
-            { id },
         );
     }
 
+    await emitEvent("recording.updated", session.user.id, updated.id);
+
+    // `{ filename }` is the upstream inline-rename contract; the fork's
+    // edit-metadata dialog also gets `startTime` back when it changed it.
     return NextResponse.json({
-        recording: {
-            ...rec,
-            filename: decryptText(rec.filename),
-        },
+        filename: decryptText(updated.filename),
+        ...(updates.startTime
+            ? { startTime: updated.startTime.toISOString() }
+            : {}),
     });
 });
 

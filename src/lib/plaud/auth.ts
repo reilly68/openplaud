@@ -1,31 +1,13 @@
-/**
- * Plaud authentication via OTP (email verification code).
- *
- * Flow:
- * 1. POST /auth/otp-send-code { username } → { status, token }
- *    - If status === -302: user's region differs; response includes
- *      data.domains.api with the correct regional API base.
- * 2. POST /auth/otp-login { code, token } → { access_token }
- *
- * Plaud issues long-lived access tokens (~300 day lifetime per decoded JWT
- * claims) and does NOT return a refresh token in the web OTP flow. When the
- * token eventually expires, users re-authenticate via the reconnect UI.
- */
-
 import { AppError, ErrorCode } from "@/lib/errors";
 import { DEFAULT_PLAUD_API_BASE } from "./client";
 import { plaudFetch } from "./fetch";
 import { safeParseJson } from "./parse";
-import { PLAUD_USER_AGENT } from "./servers";
-
-// ── Types ──────────────────────────────────────────────────────────────────
+import { isValidPlaudApiUrl, PLAUD_USER_AGENT } from "./servers";
 
 export interface PlaudSendCodeResponse {
     status: number;
     msg: string;
-    /** Short-lived JWT to pass back in otp-login */
     token?: string;
-    /** Present when status === -302 (region mismatch) */
     data?: {
         domains?: {
             api?: string;
@@ -33,34 +15,98 @@ export interface PlaudSendCodeResponse {
     };
 }
 
-export interface PlaudOtpLoginResponse {
+interface PlaudUserTokenFields {
+    access_token?: string;
+    refresh_token?: string;
+    ut_expire_at?: number;
+    urt_expire_at?: number;
+}
+
+export interface PlaudOtpLoginResponse extends PlaudUserTokenFields {
     status: number;
     msg: string;
-    /** Tokens can appear at root (observed) or under data (older/region variants) */
-    access_token?: string;
-    data?: {
-        access_token?: string;
+    data?: PlaudUserTokenFields;
+}
+
+/** Body of `POST /auth/refresh-user-token`. Same token fields as OTP login. */
+export interface PlaudRefreshUserTokenResponse extends PlaudUserTokenFields {
+    status?: number;
+    msg?: string;
+    data?: PlaudUserTokenFields;
+}
+
+/**
+ * A Plaud user token (UT) with its optional refresh token and expiries.
+ * `sessionExpiresAt` is when the sign-in ends for good: refreshing never
+ * extends past it.
+ */
+export interface PlaudTokenSet {
+    accessToken: string;
+    refreshToken: string | null;
+    accessExpiresAt: Date | null;
+    sessionExpiresAt: Date | null;
+}
+
+const MAX_REGION_REDIRECTS = 3;
+
+function unixSecondsToDate(value: unknown): Date | null {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        return null;
+    }
+    return new Date(value * 1000);
+}
+
+/**
+ * Build a token set, preferring Plaud's explicit `ut_expire_at` /
+ * `urt_expire_at` (unix seconds) and falling back to each JWT's `exp`.
+ * Without a refresh token the session ends when the access token does.
+ */
+export function buildPlaudTokenSet(input: {
+    accessToken: string;
+    refreshToken?: string | null;
+    accessExpireAt?: unknown;
+    refreshExpireAt?: unknown;
+}): PlaudTokenSet {
+    const refreshToken = input.refreshToken || null;
+    const accessExpiresAt =
+        unixSecondsToDate(input.accessExpireAt) ??
+        decodeAccessTokenExpiry(input.accessToken);
+    const sessionExpiresAt = refreshToken
+        ? (unixSecondsToDate(input.refreshExpireAt) ??
+          decodeAccessTokenExpiry(refreshToken))
+        : accessExpiresAt;
+    return {
+        accessToken: input.accessToken,
+        refreshToken,
+        accessExpiresAt,
+        sessionExpiresAt,
     };
 }
 
-// ── API calls ──────────────────────────────────────────────────────────────
+function tokenSetFromBody(
+    body: PlaudRefreshUserTokenResponse,
+    fallbackRefreshToken: string | null,
+): PlaudTokenSet | null {
+    const accessToken = body.access_token ?? body.data?.access_token;
+    if (!accessToken) return null;
+    return buildPlaudTokenSet({
+        accessToken,
+        refreshToken:
+            body.refresh_token ??
+            body.data?.refresh_token ??
+            fallbackRefreshToken,
+        accessExpireAt: body.ut_expire_at ?? body.data?.ut_expire_at,
+        refreshExpireAt: body.urt_expire_at ?? body.data?.urt_expire_at,
+    });
+}
 
-/**
- * Send a one-time verification code to the user's email.
- *
- * Returns the OTP session token on success.
- * If the user belongs to a different region, returns the correct API base
- * so the caller can retry against the right server.
- */
-const MAX_REGION_REDIRECTS = 3;
-
+/** Send an OTP code. Follows regional redirects (`status === -302`). */
 export async function plaudSendCode(
     email: string,
     apiBase: string = DEFAULT_PLAUD_API_BASE,
     _redirectCount = 0,
 ): Promise<{
     token: string;
-    /** Final resolved API base (may differ from input after region redirect) */
     apiBase: string;
 }> {
     const res = await plaudFetch(`${apiBase}/auth/otp-send-code`, {
@@ -72,13 +118,8 @@ export async function plaudSendCode(
         body: JSON.stringify({ username: email }),
     });
 
-    // Use `safeParseJson` so a Cloudflare HTML challenge body (which
-    // Plaud returns on WAF rejection) surfaces as a typed `PLAUD_API_ERROR`
-    // / `PLAUD_UPSTREAM_ERROR` instead of a raw `SyntaxError` that
-    // `apiHandler` would flatten to `INTERNAL_ERROR` (500). See #142.
     const body = await safeParseJson<PlaudSendCodeResponse>(res);
 
-    // Region mismatch → retry against the correct regional server
     if (body.status === -302 && body.data?.domains?.api) {
         if (_redirectCount >= MAX_REGION_REDIRECTS) {
             throw new AppError(
@@ -103,16 +144,12 @@ export async function plaudSendCode(
     return { token: body.token, apiBase };
 }
 
-/**
- * Verify the OTP code and obtain the access token.
- */
+/** Verify the OTP code and obtain the user token, refresh token and expiries. */
 export async function plaudVerifyOtp(
     code: string,
     otpToken: string,
     apiBase: string = DEFAULT_PLAUD_API_BASE,
-): Promise<{
-    accessToken: string;
-}> {
+): Promise<PlaudTokenSet> {
     const res = await plaudFetch(`${apiBase}/auth/otp-login`, {
         method: "POST",
         headers: {
@@ -124,11 +161,8 @@ export async function plaudVerifyOtp(
 
     const body = await safeParseJson<PlaudOtpLoginResponse>(res);
 
-    // Tokens can appear at root or nested under data
-    const accessToken =
-        body.access_token ?? body.data?.access_token ?? undefined;
-
-    if (!accessToken) {
+    const tokens = tokenSetFromBody(body, null);
+    if (!tokens) {
         throw new AppError(
             ErrorCode.PLAUD_OTP_INVALID,
             body.msg || "Invalid verification code",
@@ -137,28 +171,114 @@ export async function plaudVerifyOtp(
         );
     }
 
-    return { accessToken };
+    return tokens;
 }
 
-// ── JWT helpers (UX-only; not security boundaries) ────────────────────────
+const REFRESH_REJECTED_MESSAGE =
+    "Plaud ended this sign-in. Reconnect your Plaud account.";
 
 /**
- * Decode a Plaud access token's `exp` claim without verifying the signature.
- *
- * Plaud's user tokens are JWTs with a ~300-day lifetime. We only decode here
- * to give the paste-token UI a friendly hint ("this token expires in 3 days")
- * — actual validation always happens by hitting Plaud's /device/list. Never
- * trust the decoded payload for any security decision.
- *
- * Returns `null` on any malformed input rather than throwing — callers treat
- * a null result as "unknown expiry, let Plaud decide".
+ * Exchange a refresh token for a fresh user token
+ * (`POST /auth/refresh-user-token`). Plaud rotates the refresh token but
+ * keeps the old one valid, and never extends the session past its original
+ * end. Throws `PLAUD_INVALID_TOKEN` when Plaud rejects the refresh token,
+ * `PLAUD_RATE_LIMITED` / `PLAUD_UPSTREAM_ERROR` for transient failures
+ * (including network errors).
  */
-export function decodeAccessTokenExpiry(token: string): Date | null {
+export async function plaudRefreshUserToken(
+    refreshToken: string,
+    apiBase: string,
+): Promise<PlaudTokenSet> {
+    if (!isValidPlaudApiUrl(apiBase)) {
+        throw new AppError(
+            ErrorCode.PLAUD_INVALID_API_BASE,
+            "Invalid Plaud API base",
+            400,
+        );
+    }
+
+    let res: Response;
+    try {
+        res = await plaudFetch(`${apiBase}/auth/refresh-user-token`, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${refreshToken}`,
+                "User-Agent": PLAUD_USER_AGENT,
+            },
+        });
+    } catch {
+        throw new AppError(
+            ErrorCode.PLAUD_UPSTREAM_ERROR,
+            "Failed to communicate with Plaud. Please try again later.",
+            502,
+        );
+    }
+
+    if (res.status === 429) {
+        throw new AppError(
+            ErrorCode.PLAUD_RATE_LIMITED,
+            "Too many requests to Plaud. Please try again later.",
+            429,
+            { plaudStatus: res.status },
+        );
+    }
+    if (res.status >= 500) {
+        throw new AppError(
+            ErrorCode.PLAUD_UPSTREAM_ERROR,
+            "Plaud is temporarily unavailable. Please try again later.",
+            502,
+            { plaudStatus: res.status },
+        );
+    }
+    if (!res.ok) {
+        throw new AppError(
+            ErrorCode.PLAUD_INVALID_TOKEN,
+            REFRESH_REJECTED_MESSAGE,
+            401,
+            { plaudStatus: res.status },
+        );
+    }
+
+    const body = await safeParseJson<PlaudRefreshUserTokenResponse>(res);
+    const tokens =
+        body.status === undefined || body.status === 0
+            ? tokenSetFromBody(body, refreshToken)
+            : null;
+    if (!tokens) {
+        throw new AppError(
+            ErrorCode.PLAUD_INVALID_TOKEN,
+            REFRESH_REJECTED_MESSAGE,
+            401,
+            { plaudStatus: body.status },
+        );
+    }
+    return tokens;
+}
+
+/**
+ * Claims we read off a Plaud JWT. Plaud signs user tokens (UT), refresh
+ * tokens and workspace tokens (WT) with the same alg; the claim set is what
+ * tells a WT apart. WTs carry `ut_ref`/`wid`/`wtype`; UTs don't.
+ */
+export interface PlaudTokenClaims {
+    exp?: number;
+    iat?: number;
+    sub?: string;
+    /** Reference to the originating user token. Present on WTs only. */
+    ut_ref?: string;
+    /** Workspace id the token is scoped to. Present on WTs only. */
+    wid?: string;
+    /** Workspace type. Present on WTs only. */
+    wtype?: string;
+    [key: string]: unknown;
+}
+
+/** Decode JWT claims without verifying. UX/diagnostic hint only — never authorise from this. */
+export function decodeJwtClaims(token: string): PlaudTokenClaims | null {
     if (typeof token !== "string") return null;
     const parts = token.split(".");
     if (parts.length !== 3) return null;
     try {
-        // base64url → base64 → utf-8 JSON
         const b64 =
             parts[1].replace(/-/g, "+").replace(/_/g, "/") +
             "=".repeat((4 - (parts[1].length % 4)) % 4);
@@ -166,27 +286,42 @@ export function decodeAccessTokenExpiry(token: string): Date | null {
             typeof atob === "function"
                 ? atob(b64)
                 : Buffer.from(b64, "base64").toString("utf8");
-        const payload = JSON.parse(json) as { exp?: unknown };
-        if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
-            return null;
-        }
-        return new Date(payload.exp * 1000);
+        const payload = JSON.parse(json) as unknown;
+        if (typeof payload !== "object" || payload === null) return null;
+        return payload as PlaudTokenClaims;
     } catch {
         return null;
     }
 }
 
 /**
- * Best-effort fetch of /user/me to derive the linked Plaud account email.
- *
- * Used only by the paste-token connect flow, which doesn't otherwise know
- * the user's Plaud email. Returns `null` on any failure — the email is a
- * UX nicety (it shows up in settings as "Connected as foo@bar.com"), not
- * a correctness requirement, and plaud_connections.plaud_email is nullable.
- *
- * Same SSRF posture as the rest of this module: caller must have already
- * passed `apiBase` through `isValidPlaudApiUrl`.
+ * Decode a JWT's `exp` claim (user or refresh token) without verifying.
+ * Returns null for malformed tokens or a missing, non-numeric or
+ * non-positive `exp`. Used for expiry bookkeeping only; never authorise
+ * from this.
  */
+export function decodeAccessTokenExpiry(token: string): Date | null {
+    const claims = decodeJwtClaims(token);
+    if (!claims) return null;
+    return unixSecondsToDate(claims.exp);
+}
+
+/**
+ * True if `token` is a Plaud workspace token (WT) rather than a user token
+ * (UT). WTs are workspace-scoped (`ut_ref`/`wid` claims) and short-lived
+ * (~24h). Riffado must store the UT: minting a fresh WT requires
+ * a UT, so a connection built on a pasted WT cannot be refreshed and dies
+ * within a day. web.plaud.ai puts the WT on the data requests users tend to
+ * inspect (`/device/list`, `/file/simple/web`), which is why users paste it
+ * by mistake — hence this guard. (issue #203)
+ */
+export function isPlaudWorkspaceToken(token: string): boolean {
+    const claims = decodeJwtClaims(token);
+    if (!claims) return false;
+    return typeof claims.ut_ref === "string" || typeof claims.wid === "string";
+}
+
+/** Best-effort `/user/me` email lookup. Caller must pre-validate `apiBase`. */
 export async function fetchPlaudUserMeEmail(
     accessToken: string,
     apiBase: string,
@@ -206,8 +341,6 @@ export async function fetchPlaudUserMeEmail(
             data?: { email?: unknown };
             email?: unknown;
         };
-        // Tolerate both root-level and data-nested shapes (Plaud's response
-        // shape varies across endpoints/regions).
         const raw =
             (typeof body.email === "string" && body.email) ||
             (typeof body.data?.email === "string" && body.data.email) ||

@@ -15,6 +15,11 @@ import {
 import { useState } from "react";
 import { useConfirm } from "@/components/confirm-dialog";
 import { EditTranscriptionDialog } from "@/components/dashboard/edit-transcription-dialog";
+import { TranscribeInBrowserButton } from "@/components/dashboard/transcribe-in-browser-button";
+import {
+    RichMarkdown,
+    SpeakerTranscript,
+} from "@/components/recordings/rich-content";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -25,7 +30,6 @@ import {
     SelectValue,
 } from "@/components/ui/select";
 import { useTranscriptionSummary } from "@/hooks/use-transcription-summary";
-import { SUMMARY_PRESETS } from "@/lib/ai/summary-presets";
 import type { Recording } from "@/types/recording";
 
 interface Transcription {
@@ -34,24 +38,67 @@ interface Transcription {
     transcriptionType?: string;
 }
 
+/** A transcript variant for a single source (Plaud, the user's own, etc.). */
+export interface TranscriptOption {
+    source: string;
+    text: string;
+    language?: string;
+    provider?: string;
+    model?: string;
+}
+
 interface TranscriptionPanelProps {
     recording: Recording;
+    /** Back-compat single transcript. Used only when `transcripts` is absent. */
     transcription?: Transcription;
+    /** All transcripts for the recording, one per source, primary first. When
+     * more than one is present a source switcher is shown. */
+    transcripts?: TranscriptOption[];
     isTranscribing: boolean;
     onTranscribe: () => void;
     /** Called after a manual transcript edit is saved (decrypted text). */
     onTranscriptSaved: (text: string) => void;
+    /** Refresh handler called after a browser-side transcription completes. */
+    onTranscribeComplete?: () => void;
+}
+
+function transcriptSourceLabel(source: string): string {
+    if (source === "plaud") return "Plaud";
+    if (source === "mixed") return "Mix";
+    return "Your provider";
 }
 
 export function TranscriptionPanel({
     recording,
     transcription,
+    transcripts,
     isTranscribing,
     onTranscribe,
     onTranscriptSaved,
+    onTranscribeComplete,
 }: TranscriptionPanelProps) {
     const confirm = useConfirm();
     const [editOpen, setEditOpen] = useState(false);
+    const transcriptList: TranscriptOption[] =
+        transcripts && transcripts.length > 0
+            ? transcripts
+            : transcription?.text
+              ? [
+                    {
+                        source: "riffado",
+                        text: transcription.text,
+                        language: transcription.language,
+                    },
+                ]
+              : [];
+
+    const [activeSource, setActiveSource] = useState<string | undefined>(
+        undefined,
+    );
+    const activeTranscript =
+        transcriptList.find((t) => t.source === activeSource) ??
+        transcriptList[0];
+
     const {
         summaryData,
         isSummarizing,
@@ -59,11 +106,12 @@ export function TranscriptionPanel({
         setSummaryExpanded,
         summaryPreset,
         setSummaryPreset,
+        summaryPromptOptions,
         handleSummarize,
         handleDeleteSummary,
     } = useTranscriptionSummary({
         recordingId: recording?.id,
-        transcriptionText: transcription?.text,
+        transcriptionText: activeTranscript?.text,
     });
 
     // Whisper re-transcribe overwrites the stored text. If the current
@@ -98,17 +146,20 @@ export function TranscriptionPanel({
                             Transcription
                         </CardTitle>
                         <div className="flex items-center gap-2">
-                            {transcription?.text && (
+                            {activeTranscript?.text && (
                                 <>
-                                    <Button
-                                        onClick={() => setEditOpen(true)}
-                                        size="sm"
-                                        variant="outline"
-                                        disabled={isTranscribing}
-                                    >
-                                        <Pencil className="size-4 mr-2" />
-                                        Edit
-                                    </Button>
+                                    {/* Fork: manual edit applies to our own transcript row. */}
+                                    {transcription?.text && (
+                                        <Button
+                                            onClick={() => setEditOpen(true)}
+                                            size="sm"
+                                            variant="outline"
+                                            disabled={isTranscribing}
+                                        >
+                                            <Pencil className="size-4 mr-2" />
+                                            Edit
+                                        </Button>
+                                    )}
                                     <Button
                                         onClick={handleReTranscribe}
                                         size="sm"
@@ -120,15 +171,32 @@ export function TranscriptionPanel({
                                     </Button>
                                 </>
                             )}
-                            {!transcription?.text && !isTranscribing && (
-                                <Button
-                                    onClick={onTranscribe}
-                                    size="sm"
-                                    disabled={isTranscribing}
-                                >
-                                    <Sparkles className="size-4 mr-2" />
-                                    Transcribe
-                                </Button>
+                            {!activeTranscript?.text && !isTranscribing && (
+                                <>
+                                    <Button
+                                        onClick={onTranscribe}
+                                        size="sm"
+                                        disabled={isTranscribing}
+                                    >
+                                        <Sparkles className="size-4 mr-2" />
+                                        Transcribe
+                                    </Button>
+                                    <TranscribeInBrowserButton
+                                        recordingId={recording.id}
+                                        disabled={isTranscribing}
+                                        onComplete={
+                                            // Falling back to `onTranscribe` here
+                                            // would kick off a redundant SERVER
+                                            // transcription right after a
+                                            // successful browser one, possibly
+                                            // overwriting it. Callers that care
+                                            // about refreshing after a browser
+                                            // transcription must pass
+                                            // `onTranscribeComplete` explicitly.
+                                            onTranscribeComplete ?? (() => {})
+                                        }
+                                    />
+                                </>
                             )}
                         </div>
                     </div>
@@ -141,31 +209,59 @@ export function TranscriptionPanel({
                                 Transcribing audio…
                             </p>
                         </div>
-                    ) : transcription?.text ? (
+                    ) : activeTranscript?.text ? (
                         <div className="space-y-4">
-                            <div className="bg-muted rounded-lg p-4 max-h-96 overflow-y-auto">
-                                <p className="text-sm whitespace-pre-wrap leading-relaxed">
-                                    {transcription.text}
-                                </p>
+                            {transcriptList.length > 1 && (
+                                <div className="flex items-center gap-2 border-b pb-2">
+                                    {transcriptList.map((t) => (
+                                        <button
+                                            key={t.source}
+                                            type="button"
+                                            onClick={() =>
+                                                setActiveSource(t.source)
+                                            }
+                                            className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                                                t.source ===
+                                                activeTranscript.source
+                                                    ? "bg-primary text-primary-foreground"
+                                                    : "bg-muted text-muted-foreground hover:text-foreground"
+                                            }`}
+                                        >
+                                            {transcriptSourceLabel(t.source)}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                            <div className="bg-muted rounded-lg p-4 max-h-96 overflow-y-auto text-sm">
+                                <SpeakerTranscript
+                                    text={activeTranscript.text}
+                                />
                             </div>
                             <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
-                                {transcription.language && (
+                                <span className="px-2 py-0.5 rounded bg-muted font-medium">
+                                    {transcriptSourceLabel(
+                                        activeTranscript.source,
+                                    )}
+                                </span>
+                                {activeTranscript.language && (
                                     <div className="flex items-center gap-1">
                                         <Languages className="size-3" />
                                         <span>
-                                            Language: {transcription.language}
+                                            Language:{" "}
+                                            {activeTranscript.language}
                                         </span>
                                     </div>
                                 )}
                                 <div>
-                                    {transcription.text.trim()
-                                        ? transcription.text.trim().split(/\s+/)
-                                              .length
+                                    {activeTranscript.text.trim()
+                                        ? activeTranscript.text
+                                              .trim()
+                                              .split(/\s+/).length
                                         : 0}{" "}
                                     words
                                 </div>
                                 <div>
-                                    {transcription.text.length} characters
+                                    {activeTranscript.text.length} characters
                                 </div>
                             </div>
                         </div>
@@ -181,8 +277,8 @@ export function TranscriptionPanel({
                 </CardContent>
             </Card>
 
-            {/* Summary Card -- only show when transcription exists */}
-            {transcription?.text && (
+            {/* Summary Card -- only show when a transcript exists */}
+            {activeTranscript?.text && (
                 <Card>
                     <CardHeader>
                         <div className="flex items-center justify-between">
@@ -200,7 +296,7 @@ export function TranscriptionPanel({
                                             <SelectValue />
                                         </SelectTrigger>
                                         <SelectContent>
-                                            {Object.values(SUMMARY_PRESETS).map(
+                                            {summaryPromptOptions.map(
                                                 (preset) => (
                                                     <SelectItem
                                                         key={preset.id}
@@ -271,10 +367,10 @@ export function TranscriptionPanel({
                                 {summaryExpanded && (
                                     <div className="space-y-4">
                                         {/* Summary text */}
-                                        <div className="bg-muted rounded-lg p-4">
-                                            <p className="text-sm leading-relaxed">
-                                                {summaryData.summary}
-                                            </p>
+                                        <div className="bg-muted rounded-lg p-4 text-sm">
+                                            <RichMarkdown
+                                                content={summaryData.summary}
+                                            />
                                         </div>
 
                                         {/* Key points */}

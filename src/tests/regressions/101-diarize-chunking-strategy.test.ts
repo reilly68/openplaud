@@ -106,6 +106,7 @@ vi.mock("@/db", () => ({
         select: vi.fn(),
         insert: vi.fn(),
         update: vi.fn(),
+        delete: vi.fn(),
         transaction: vi.fn(),
     },
 }));
@@ -147,12 +148,42 @@ vi.mock("@/lib/webhooks/emit", () => ({
     emitEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("@/lib/entitlements", () => ({
+    isHostedLockedOut: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("@/lib/env", () => ({
+    env: {
+        WHISPER_MAX_BYTES: 24 * 1024 * 1024,
+        WHISPER_COMPRESS_BITRATE_KBPS: 12,
+        WHISPER_REQUEST_TIMEOUT_MS: 60 * 60 * 1000,
+    },
+}));
+
+vi.mock("@/lib/hosted/transcription/mynah", () => ({
+    isMynahConfigured: vi.fn().mockReturnValue(false),
+    transcribeViaMynah: vi.fn(),
+}));
+
 vi.mock("@/lib/ai/generate-title", () => ({
     generateTitleFromTranscription: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("@/lib/plaud/client-factory", () => ({
     createPlaudClient: vi.fn(),
+}));
+
+vi.mock("@/lib/transcription/ffmpeg", () => ({
+    transcodeToMp3: vi.fn().mockResolvedValue(Buffer.from("fake-mp3-bytes")),
+    transcodeToMp3Segments: vi.fn(() =>
+        (async function* () {
+            yield {
+                buffer: Buffer.from("fake-mp3-chunk"),
+                index: 0,
+                count: 1,
+            };
+        })(),
+    ),
 }));
 
 import { OpenAI } from "openai";
@@ -177,6 +208,7 @@ describe("issue #101 — transcribeRecording sends chunking_strategy for diarize
             plaudFileId: "plaud-1",
             filename: "Some Recording",
             storagePath: "rec-101.mp3",
+            duration: 60_000,
             deletedAt: null,
         };
         const credsRow = {
@@ -267,6 +299,11 @@ describe("issue #101 — transcribeRecording sends chunking_strategy for diarize
         (db.transaction as Mock).mockImplementation(
             async (cb: (t: typeof tx) => Promise<unknown>) => cb(tx),
         );
+        // Stale-summary invalidation on forced re-transcribe issues a
+        // top-level `db.delete(aiEnhancements)` outside the transaction.
+        (db.delete as Mock).mockReturnValue({
+            where: vi.fn().mockResolvedValue(undefined),
+        });
     }
 
     beforeEach(() => {

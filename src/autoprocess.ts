@@ -86,7 +86,9 @@ function httpPost(
         const hardTimer = setTimeout(() => {
             if (settled) return;
             settled = true;
-            req.destroy(new Error(`httpPost hard timeout after ${timeoutMs}ms`));
+            req.destroy(
+                new Error(`httpPost hard timeout after ${timeoutMs}ms`),
+            );
             reject(new Error(`httpPost hard timeout after ${timeoutMs}ms`));
         }, timeoutMs);
         const finish = (fn: () => void) => {
@@ -120,7 +122,9 @@ function httpPost(
                             resolve(JSON.parse(raw));
                         } catch {
                             reject(
-                                new Error(`JSON parse error: ${raw.slice(0, 120)}`),
+                                new Error(
+                                    `JSON parse error: ${raw.slice(0, 120)}`,
+                                ),
                             );
                         }
                     });

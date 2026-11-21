@@ -21,7 +21,10 @@ interface Props {
     visibleRecordings: Recording[];
     onTranscribe: () => void;
     onTranscriptSaved: (recordingId: string, text: string) => void;
+    /** Called after a browser-side transcription completes (refresh data). */
+    onTranscribeComplete?: () => void;
     onSelectRecording: (r: Recording) => void;
+    onRenamed?: (filename: string) => void;
     onBackToList: () => void;
     /** When true, the pane is hidden (mobile list view active). */
     hiddenOnMobile: boolean;
@@ -48,7 +51,9 @@ export function WorkstationDetailPane({
     visibleRecordings,
     onTranscribe,
     onTranscriptSaved,
+    onTranscribeComplete,
     onSelectRecording,
+    onRenamed,
     onBackToList,
     hiddenOnMobile,
     initialPlaybackSpeed,
@@ -86,6 +91,7 @@ export function WorkstationDetailPane({
                         initialVolume={initialVolume}
                         initialAutoPlayNext={initialAutoPlayNext}
                         scrubberStyle={scrubberStyle}
+                        onRenamed={onRenamed}
                         onEnded={() => {
                             const currentIndex = visibleRecordings.findIndex(
                                 (r) => r.id === currentRecording.id,
@@ -108,6 +114,7 @@ export function WorkstationDetailPane({
                         onTranscriptSaved={(text) =>
                             onTranscriptSaved(currentRecording.id, text)
                         }
+                        onTranscribeComplete={onTranscribeComplete}
                     />
                 </>
             ) : (

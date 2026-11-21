@@ -1,17 +1,15 @@
 import { env } from "../env";
+import { withStorageTiming } from "../status/storage";
 import { LocalStorage } from "./local-storage";
 import { S3Storage } from "./s3-storage";
 import type { S3Config, StorageProvider } from "./types";
 
-/**
- * Create storage provider based on environment configuration
- * Storage is configured at the instance level, not per-user
- */
+/** Build the instance-level storage provider from env. */
 export function createStorageProvider(): StorageProvider {
     const storageType = env.DEFAULT_STORAGE_TYPE;
 
     if (storageType === "local") {
-        return new LocalStorage();
+        return withStorageTiming(new LocalStorage());
     }
 
     if (storageType === "s3") {
@@ -34,16 +32,12 @@ export function createStorageProvider(): StorageProvider {
             );
         }
 
-        return new S3Storage(s3Config);
+        return withStorageTiming(new S3Storage(s3Config));
     }
 
     throw new Error(`Unsupported storage type: ${storageType}`);
 }
 
-/**
- * Create storage provider for a user
- * Uses the instance-level storage configuration from environment
- */
 export async function createUserStorageProvider(
     _userId: string,
 ): Promise<StorageProvider> {
@@ -52,5 +46,4 @@ export async function createUserStorageProvider(
 
 export { LocalStorage } from "./local-storage";
 export { S3Storage } from "./s3-storage";
-// Export everything
 export * from "./types";

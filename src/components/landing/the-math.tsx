@@ -1,89 +1,252 @@
-export function TheMath() {
+import type { FoundingMemberAvailabilityRow } from "@/db/queries/billing";
+import { env } from "@/lib/env";
+import {
+    type BillingCurrency,
+    billingPriceCatalog,
+    pickDisplayPrice,
+    trimDisplayAmount,
+} from "@/lib/hosted/billing/pricing";
+
+/**
+ * Industry-survey-style pricing context. Three-vendor format (not
+ * head-to-head) using each vendor's own published numbers. Reframe
+ * any future edits the same way: factual, dated, no qualitative
+ * claims about competitors, no implication that subscription
+ * services are overpriced. We show how the underlying-AI economics
+ * work -- the reader does the math themselves.
+ *
+ * The Hosted Pro row stays monthly-framed and derives its amount
+ * from the first configured monthly catalog Price (USD preferred);
+ * the per-hour figure uses the configured included transcription allowance.
+ *
+ * `perHour` is the price normalized to one hour of audio where a row
+ * has a fixed minute allowance or published metered rate. Subscription
+ * rows divide the sticker price by the plan's included minutes;
+ * Riffado rows either show the Hosted Pro included allowance or the
+ * upstream provider's published per-minute/per-hour rate. Always the
+ * vendor's own number -- never a derived "savings" claim.
+ */
+const SUBSCRIPTION_SERVICES = [
+    {
+        name: "Plaud Pro",
+        price: "$17.99",
+        unit: "/ month",
+        scope: "1,200 transcription minutes",
+        perHour: "$0.90 / hr",
+    },
+    {
+        name: "Otter Business",
+        price: "$30",
+        unit: "/ user / month",
+        scope: "6,000 transcription minutes",
+        perHour: "$0.30 / hr",
+    },
+    {
+        name: "Rev Essentials",
+        price: "$29.99",
+        unit: "/ seat / month",
+        scope: "5,000 transcription minutes",
+        perHour: "$0.36 / hr",
+    },
+];
+
+const HOSTED_PRO_INCLUDED_HOURS = env.BILLING_PRO_INCLUDED_SECONDS / 3600;
+
+export function TheMath({
+    availability,
+    currency,
+}: {
+    availability: FoundingMemberAvailabilityRow;
+    currency: BillingCurrency;
+}) {
+    const catalog = billingPriceCatalog(availability);
+    const foundingPrice = pickDisplayPrice(catalog.monthly.founding, currency);
+    const standardPrice = pickDisplayPrice(catalog.monthly.standard, currency);
+    const foundingOfferActive =
+        availability.remaining > 0 && foundingPrice !== null;
+    const monthlyPrice = foundingOfferActive ? foundingPrice : standardPrice;
+    const monthlyAmount = monthlyPrice?.displayAmount ?? null;
+    const currencySymbol = monthlyPrice?.currency === "eur" ? "€" : "$";
+    const displayPrice = monthlyAmount
+        ? `${currencySymbol}${trimDisplayAmount(monthlyAmount)}`
+        : "Unavailable";
+    const riffadoOptions: Row[] = [
+        {
+            name: "Hosted Pro + Mynah",
+            notice: foundingOfferActive
+                ? `Limited founding offer · ${availability.remaining} spot${availability.remaining === 1 ? "" : "s"} left`
+                : undefined,
+            price: displayPrice,
+            unit: monthlyAmount ? "/ month" : "",
+            scope: `${HOSTED_PRO_INCLUDED_HOURS} hours of included cloud transcription + 50 GB storage`,
+            perHour:
+                monthlyAmount && HOSTED_PRO_INCLUDED_HOURS > 0
+                    ? `${currencySymbol}${(
+                          Number.parseFloat(monthlyAmount) /
+                              HOSTED_PRO_INCLUDED_HOURS
+                      ).toFixed(2)} / included hr`
+                    : "—",
+        },
+        {
+            name: "Riffado in your browser",
+            price: "$0.00",
+            unit: "free",
+            scope: "Whisper via Transformers.js, no key required",
+            perHour: "$0.00 / hr",
+        },
+        {
+            name: "Bring your own AI provider",
+            price: "At cost",
+            unit: "no markup",
+            scope: "OpenAI, Groq, Ollama, LM Studio, or another compatible provider",
+            perHour: "provider rate",
+        },
+    ];
+
     return (
-        <section className="py-24 border-y border-border/40 bg-secondary/10">
+        <section className="pt-40 md:pt-56 lg:pt-72 pb-24 border-y border-border/40 bg-secondary/10">
             <div className="container mx-auto px-4">
-                <div className="max-w-3xl mx-auto">
-                    <h2 className="text-3xl md:text-4xl font-semibold tracking-tight mb-4">
-                        Here's what you're actually paying for.
-                    </h2>
-                    <p className="text-muted-foreground text-lg leading-relaxed mb-12">
-                        Plaud doesn't transcribe your audio. OpenAI, Groq, and
-                        similar do. Plaud marks it up and wraps a subscription
-                        around it. OpenPlaud lets you pay the provider directly.
-                    </p>
-
-                    <div className="rounded-2xl border border-border bg-card overflow-hidden">
-                        <div className="flex items-baseline justify-between gap-6 p-6 md:p-8 border-b border-border">
-                            <div>
-                                <div className="text-sm font-medium text-muted-foreground mb-1">
-                                    Plaud Pro
-                                </div>
-                                <div className="text-xs text-muted-foreground/80">
-                                    1,200 minutes of transcription per month
-                                </div>
-                            </div>
-                            <div className="text-right shrink-0">
-                                <div className="text-4xl md:text-5xl font-bold tracking-tight tabular-nums">
-                                    $17.99
-                                </div>
-                                <div className="text-xs text-muted-foreground mt-1">
-                                    every month
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="flex items-baseline justify-between gap-6 p-6 md:p-8 border-b border-border">
-                            <div>
-                                <div className="text-sm font-medium mb-1">
-                                    OpenPlaud{" "}
-                                    <span className="text-muted-foreground font-normal">
-                                        + OpenAI Whisper
-                                    </span>
-                                </div>
-                                <div className="text-xs text-muted-foreground/80">
-                                    Same 1,200 minutes, paid to OpenAI directly
-                                </div>
-                            </div>
-                            <div className="text-right shrink-0">
-                                <div className="text-3xl md:text-4xl font-semibold tracking-tight tabular-nums">
-                                    $7.20
-                                </div>
-                                <div className="text-xs text-muted-foreground mt-1">
-                                    one-time
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="flex items-baseline justify-between gap-6 p-6 md:p-8">
-                            <div>
-                                <div className="text-sm font-medium mb-1">
-                                    OpenPlaud{" "}
-                                    <span className="text-muted-foreground font-normal">
-                                        + Groq Whisper
-                                    </span>
-                                </div>
-                                <div className="text-xs text-muted-foreground/80">
-                                    Same 1,200 minutes, paid to Groq directly
-                                </div>
-                            </div>
-                            <div className="text-right shrink-0">
-                                <div className="text-3xl md:text-4xl font-semibold tracking-tight tabular-nums text-primary">
-                                    $2.22
-                                </div>
-                                <div className="text-xs text-muted-foreground mt-1">
-                                    one-time
-                                </div>
-                            </div>
-                        </div>
+                <div className="mx-auto max-w-5xl">
+                    <div className="max-w-2xl">
+                        <p className="text-sm font-mono text-muted-foreground uppercase tracking-wider mb-4">
+                            What your monthly price includes
+                        </p>
+                        <h2 className="text-3xl md:text-4xl font-semibold tracking-tight mb-4 text-balance">
+                            {HOSTED_PRO_INCLUDED_HOURS} hours of transcription.
+                            No separate AI bill.
+                        </h2>
+                        <p className="text-muted-foreground text-lg leading-relaxed text-pretty">
+                            Hosted Pro includes Mynah cloud transcription for
+                            everyday use. You can also transcribe free in your
+                            browser, or connect OpenAI, Groq, Ollama, or another
+                            provider. Riffado adds no markup when you bring your
+                            own.
+                        </p>
                     </div>
 
-                    <p className="text-xs text-muted-foreground/80 mt-4 leading-relaxed">
-                        OpenAI Whisper: $0.006 per minute. Groq Whisper Large
-                        v3: $0.111 per hour. Rates as published by each
-                        provider; you pay them directly with your own API key.
+                    <div className="mt-10 grid gap-4 lg:grid-cols-2 lg:gap-6 items-stretch">
+                        <PriceTable
+                            label="Subscription services"
+                            rows={SUBSCRIPTION_SERVICES}
+                            tone="muted"
+                        />
+                        <PriceTable
+                            label="With Riffado"
+                            rows={riffadoOptions}
+                            tone="primary"
+                            highlightFirst
+                        />
+                    </div>
+
+                    <p className="mt-6 text-xs text-muted-foreground/80 leading-relaxed text-pretty max-w-2xl">
+                        Published monthly pricing as of July 2026. Plans, minute
+                        ceilings, and trademarks belong to their respective
+                        owners; shown for descriptive context, not comparison.
+                        Hosted Pro includes {HOSTED_PRO_INCLUDED_HOURS} hours of
+                        Mynah transcription per month; Riffado itself is free to
+                        self-host.
                     </p>
                 </div>
             </div>
         </section>
+    );
+}
+
+type Row = {
+    name: string;
+    notice?: string;
+    price: string;
+    unit: string;
+    scope: string;
+    perHour: string;
+};
+
+function PriceTable({
+    label,
+    rows,
+    tone,
+    highlightFirst,
+}: {
+    label: string;
+    rows: Row[];
+    /**
+     * Both cards share identical chrome (border, radius, row height,
+     * price font size) so they pair as a single comparison. Hierarchy
+     * comes from `tone` -- subscriptions render in muted-foreground,
+     * Riffado in foreground, the highlighted free row in primary --
+     * never from size. Resizing prices made the rows misalign in the
+     * previous version.
+     */
+    tone: "muted" | "primary";
+    /**
+     * Riffado side leads with the strongest proof (free in browser).
+     * Highlight the first row instead of the last so the eye lands on
+     * "$0.00" before scanning the rest.
+     */
+    highlightFirst?: boolean;
+}) {
+    const isMuted = tone === "muted";
+    return (
+        <div
+            className={`rounded-2xl border border-border overflow-hidden h-full flex flex-col ${
+                isMuted ? "bg-card/50" : "bg-card"
+            }`}
+        >
+            <div className="px-5 md:px-6 py-3 border-b border-border bg-background/40">
+                <div className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
+                    {label}
+                </div>
+            </div>
+            <div className="flex-1 flex flex-col">
+                {rows.map((row, i) => {
+                    const isFirst = i === 0;
+                    const highlight = highlightFirst && isFirst;
+                    return (
+                        <div
+                            key={row.name}
+                            className={`flex-1 flex items-center justify-between gap-4 px-5 md:px-6 py-5 ${
+                                i < rows.length - 1
+                                    ? "border-b border-border"
+                                    : ""
+                            }`}
+                        >
+                            <div className="min-w-0">
+                                {row.notice ? (
+                                    <div className="mb-1 text-xs font-medium text-primary">
+                                        {row.notice}
+                                    </div>
+                                ) : null}
+                                <div className="text-sm font-medium text-foreground mb-1 truncate">
+                                    {row.name}
+                                </div>
+                                <div className="text-xs leading-snug text-muted-foreground">
+                                    {row.scope}
+                                </div>
+                            </div>
+                            <div className="text-right shrink-0">
+                                <div
+                                    className={`text-3xl md:text-4xl font-semibold tracking-tight tabular-nums leading-none ${
+                                        highlight
+                                            ? "text-primary"
+                                            : isMuted
+                                              ? "text-muted-foreground"
+                                              : "text-foreground"
+                                    }`}
+                                >
+                                    {row.price}
+                                </div>
+                                <div className="mt-2 text-xs text-muted-foreground tabular-nums">
+                                    {row.unit}
+                                    <span className="text-muted-foreground/60">
+                                        {" "}
+                                        &middot; {row.perHour}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
     );
 }

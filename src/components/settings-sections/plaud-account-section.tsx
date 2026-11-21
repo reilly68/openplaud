@@ -16,12 +16,18 @@ import {
     DialogTitle,
 } from "@/components/ui/dialog";
 import { getApiErrorMessage } from "@/lib/api-errors";
+import { formatDateTime } from "@/lib/format-date";
+import { plaudConnectionBannerState } from "@/lib/plaud/connection-expiry";
 import { PLAUD_SERVERS, type PlaudServerKey } from "@/lib/plaud/servers";
 
 interface ConnectionInfo {
     connected: boolean;
     server?: PlaudServerKey;
     plaudEmail?: string | null;
+    needsReconnect?: boolean;
+    accessExpiresAt?: string | null;
+    sessionExpiresAt?: string | null;
+    autoRenews?: boolean;
     createdAt?: string;
     updatedAt?: string;
     apiBase?: string;
@@ -41,16 +47,32 @@ function regionLabel(
     if (server === "global") return "Global";
     if (server === "eu") return "EU (Frankfurt)";
     if (server === "apse1") return "Asia Pacific (Singapore)";
+    if (server === "cn") return "China Mainland";
     return server;
 }
 
-export function PlaudAccountSection() {
+interface PlaudAccountSectionProps {
+    /**
+     * Called after a successful reconnect or account switch, in addition
+     * to this component's own `fetchConnection()`. Lets the dashboard
+     * (`Workstation`) refresh its server-rendered `plaudNeedsReconnect`
+     * prop and kick off a fresh sync -- without it, the dashboard's
+     * `PlaudReconnectBanner` can stay stale until the next periodic sync
+     * since it's driven by separate client state, not this section's.
+     */
+    onReconnected?: () => void;
+}
+
+export function PlaudAccountSection({
+    onReconnected,
+}: PlaudAccountSectionProps = {}) {
     const [info, setInfo] = useState<ConnectionInfo | null>(null);
     const [isLoading, setIsLoading] = useState(true);
     const [confirmOpen, setConfirmOpen] = useState<
         null | "switch" | "disconnect"
     >(null);
     const [switchDialogOpen, setSwitchDialogOpen] = useState(false);
+    const [reconnectDialogOpen, setReconnectDialogOpen] = useState(false);
     const [isMutating, setIsMutating] = useState(false);
 
     const fetchConnection = useCallback(async () => {
@@ -130,7 +152,14 @@ export function PlaudAccountSection() {
     const handleSwitchSuccess = useCallback(async () => {
         setSwitchDialogOpen(false);
         await fetchConnection();
-    }, [fetchConnection]);
+        onReconnected?.();
+    }, [fetchConnection, onReconnected]);
+
+    const handleReconnectSuccess = useCallback(async () => {
+        setReconnectDialogOpen(false);
+        await fetchConnection();
+        onReconnected?.();
+    }, [fetchConnection, onReconnected]);
 
     if (isLoading) {
         return (
@@ -142,6 +171,16 @@ export function PlaudAccountSection() {
 
     const currentEmail = info?.plaudEmail ?? null;
     const currentEmailDisplay = currentEmail ?? "the current account";
+    const connectionState = info?.connected
+        ? plaudConnectionBannerState({
+              needsReconnect: info.needsReconnect === true,
+              sessionExpiresAt: info.sessionExpiresAt,
+              now: Date.now(),
+          })
+        : null;
+    const sessionEndsOn = info?.sessionExpiresAt
+        ? formatDateTime(info.sessionExpiresAt, "absolute")
+        : null;
 
     return (
         <div className="space-y-6">
@@ -152,7 +191,7 @@ export function PlaudAccountSection() {
                     icon={Mic}
                 />
                 <p className="text-sm text-muted-foreground mt-1">
-                    The Plaud account OpenPlaud pulls recordings from. Switching
+                    The Plaud account Riffado pulls recordings from. Switching
                     accounts keeps your existing recordings; only future syncs
                     change.
                 </p>
@@ -188,10 +227,37 @@ export function PlaudAccountSection() {
                                         </>
                                     )}
                                 </p>
+                                {sessionEndsOn && connectionState === null && (
+                                    <p className="text-sm text-muted-foreground">
+                                        Connected until {sessionEndsOn}
+                                    </p>
+                                )}
                             </div>
                         </div>
 
+                        {connectionState === "reconnect" && (
+                            <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-500">
+                                Plaud stopped accepting this sign-in, so syncing
+                                is paused. Reconnect to resume. Your recordings
+                                stay put.
+                            </p>
+                        )}
+                        {connectionState === "ending-soon" && (
+                            <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-500">
+                                Your Plaud connection ends on {sessionEndsOn}.
+                                Reconnect to keep syncing.
+                            </p>
+                        )}
+
                         <div className="flex flex-wrap gap-2">
+                            {connectionState !== null && (
+                                <Button
+                                    onClick={() => setReconnectDialogOpen(true)}
+                                >
+                                    <RefreshCw className="size-4 mr-2" />
+                                    Reconnect
+                                </Button>
+                            )}
                             <Button
                                 variant="outline"
                                 onClick={() => setConfirmOpen("switch")}
@@ -219,7 +285,6 @@ export function PlaudAccountSection() {
                         </p>
                         <PlaudConnectTabs
                             onConnected={() => fetchConnection()}
-                            variant="dialog"
                         />
                     </CardContent>
                 </Card>
@@ -308,9 +373,32 @@ export function PlaudAccountSection() {
                         </DialogDescription>
                     </DialogHeader>
                     {switchDialogOpen && (
+                        <PlaudConnectTabs onConnected={handleSwitchSuccess} />
+                    )}
+                </DialogContent>
+            </Dialog>
+
+            {/* Reconnect: same-account recovery from an invalidated token.
+                Unlike "Switch account", this never deletes the existing
+                connection/device rows first -- persistPlaudConnection()
+                upserts, so re-authenticating with the same (or a new)
+                account is safe even if the user backs out of the dialog
+                without finishing. */}
+            <Dialog
+                open={reconnectDialogOpen}
+                onOpenChange={(open) => setReconnectDialogOpen(open)}
+            >
+                <DialogContent className="max-w-lg">
+                    <DialogHeader>
+                        <DialogTitle>Reconnect your Plaud account</DialogTitle>
+                        <DialogDescription>
+                            Sign back in to resume syncing. Your existing
+                            recordings and transcripts are unaffected.
+                        </DialogDescription>
+                    </DialogHeader>
+                    {reconnectDialogOpen && (
                         <PlaudConnectTabs
-                            onConnected={handleSwitchSuccess}
-                            variant="dialog"
+                            onConnected={handleReconnectSuccess}
                         />
                     )}
                 </DialogContent>

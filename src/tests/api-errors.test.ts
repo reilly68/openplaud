@@ -9,7 +9,16 @@
  *   - `getApiErrorMessage` always returns a non-empty string.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// `@/lib/errors` now imports `@/lib/posthog-server` (captures 5xx as
+// exceptions), which imports `@/lib/env` -- eagerly validated at module
+// load and unrelated to what this pure envelope-parser test covers.
+vi.mock("@/lib/posthog-server", () => ({
+    captureServerException: vi.fn(),
+    captureServerEvent: vi.fn(),
+}));
+
 import { getApiErrorMessage, parseApiError } from "@/lib/api-errors";
 import { ErrorCode } from "@/lib/errors";
 

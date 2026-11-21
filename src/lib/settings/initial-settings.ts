@@ -1,25 +1,3 @@
-/**
- * Single source of truth for the typed `InitialSettings` shape that
- * server components feed into Workstation / RecordingWorkstation, plus
- * the row → shape adapter.
- *
- * Why this exists: the same defaults used to live inline in
- * `src/app/(app)/dashboard/page.tsx` and (partially) in
- * `src/app/(app)/recordings/[id]/page.tsx`, while the API route
- * `src/app/api/settings/user/route.ts` owns a separate
- * `DEFAULT_SETTINGS` constant for its GET fallback. Keeping these in
- * lockstep by hand was already drifting (e.g. `playerScrubber` was
- * added in the dashboard page but the detail page fell back to a
- * hard-coded `"waveform"`). Centralizing here means a new preference
- * defaults in exactly one place.
- *
- * The API route's `DEFAULT_SETTINGS` covers a wider surface
- * (notifications, encryption envelopes, export presets) — this module
- * intentionally only mirrors the slice the dashboard UI consumes. If a
- * new field starts being rendered from `initialSettings`, add it here
- * and to the route's defaults together.
- */
-
 import type { userSettings } from "@/db/schema";
 
 export interface InitialSettings {
@@ -38,6 +16,14 @@ export interface InitialSettings {
     syncOnVisibilityChange: boolean;
     syncNotifications: boolean;
     browserNotifications: boolean;
+    /**
+     * True once the user has clicked through the onboarding dialog's
+     * "Get Started" step. Drives the mandatory onboarding gate in
+     * `Workstation` -- when false, the dialog auto-opens and can't be
+     * dismissed. See `onboarding-dialog.tsx` and `requireCompletedOnboarding`
+     * in `auth-server.ts`.
+     */
+    onboardingCompleted: boolean;
 }
 
 export const INITIAL_SETTINGS_DEFAULTS: InitialSettings = {
@@ -50,22 +36,17 @@ export const INITIAL_SETTINGS_DEFAULTS: InitialSettings = {
     defaultVolume: 75,
     autoPlayNext: false,
     playerScrubber: "waveform",
-    syncInterval: 300_000, // 5 minutes
+    syncInterval: 300_000,
     autoSyncEnabled: true,
     syncOnMount: true,
     syncOnVisibilityChange: true,
     syncNotifications: true,
     browserNotifications: true,
+    onboardingCompleted: false,
 };
 
 type Row = typeof userSettings.$inferSelect | undefined | null;
 
-/**
- * Coalesce a `user_settings` row into a fully-typed `InitialSettings`,
- * falling back to `INITIAL_SETTINGS_DEFAULTS` for any null/missing
- * field. Narrows the wide enum strings stored as varchar back into the
- * literal-union types the UI expects.
- */
 export function initialSettingsFromRow(row: Row): InitialSettings {
     const r = row ?? undefined;
     return {
@@ -98,5 +79,8 @@ export function initialSettingsFromRow(row: Row): InitialSettings {
         browserNotifications:
             r?.browserNotifications ??
             INITIAL_SETTINGS_DEFAULTS.browserNotifications,
+        onboardingCompleted:
+            r?.onboardingCompleted ??
+            INITIAL_SETTINGS_DEFAULTS.onboardingCompleted,
     };
 }

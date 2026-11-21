@@ -1,4 +1,19 @@
 import { toNextJsHandler } from "better-auth/next-js";
 import { auth } from "@/lib/auth";
+import { enforceAuthRateLimit } from "@/lib/auth-rate-limit";
+import { judgeAuthResponse } from "@/lib/status/outcomes";
+import { trackCall } from "@/lib/status/record";
 
-export const { GET, POST } = toNextJsHandler(auth);
+const handlers = toNextJsHandler(auth);
+
+export const GET = handlers.GET;
+
+export async function POST(request: Request): Promise<Response> {
+    const limited = await enforceAuthRateLimit(request);
+    if (limited) return limited;
+    return trackCall(
+        "sign-in",
+        () => handlers.POST(request),
+        judgeAuthResponse,
+    );
+}

@@ -3,6 +3,7 @@
 import { useCallback } from "react";
 import { SettingsNavMobile } from "@/components/settings-nav-mobile";
 import { SettingsNavSidebar } from "@/components/settings-nav-sidebar";
+import type { Provider } from "@/components/settings-sections/providers-section";
 import {
     Dialog,
     DialogContent,
@@ -14,36 +15,37 @@ import { useSettingsNav } from "@/hooks/use-settings-nav";
 import type { SettingsSection } from "@/types/settings";
 import { SettingsContent } from "./settings-content";
 
-export interface Provider {
-    id: string;
-    provider: string;
-    baseUrl: string | null;
-    defaultModel: string | null;
-    isDefaultTranscription: boolean;
-    isDefaultEnhancement: boolean;
-    createdAt: Date;
-}
-
 interface SettingsDialogProps {
     open: boolean;
     onOpenChange: (open: boolean) => void;
-    initialProviders?: Provider[];
+    /** AI providers for the Providers section; null while loading. */
+    providers: Provider[] | null;
+    /** Receives the provider list re-read after a change in the Providers section. */
+    onProvidersChange: (providers: Provider[]) => void;
+    /** True when the provider list could not be loaded. */
+    providersLoadFailed?: boolean;
+    /** Retries loading the provider list. */
+    onRetryProviders?: () => void;
     onReRunOnboarding?: () => void;
     isHosted?: boolean;
+    /** Forwarded to `SettingsContent` -> `PlaudAccountSection`. */
+    onPlaudReconnected?: () => void;
 }
-
-const EMPTY_PROVIDERS: Provider[] = [];
 
 export function SettingsDialog({
     open,
     onOpenChange,
-    initialProviders = EMPTY_PROVIDERS,
+    providers,
+    onProvidersChange,
+    providersLoadFailed,
+    onRetryProviders,
     onReRunOnboarding,
     isHosted = false,
+    onPlaudReconnected,
 }: SettingsDialogProps) {
     const onClose = useCallback(() => onOpenChange(false), [onOpenChange]);
     const { activeSection, setActiveSection, keyboardSelectedIndex } =
-        useSettingsNav(open, onClose);
+        useSettingsNav(open, onClose, isHosted);
 
     const handleSectionChange = useCallback(
         (section: SettingsSection) => setActiveSection(section),
@@ -63,6 +65,7 @@ export function SettingsDialog({
                         activeSection={activeSection}
                         keyboardSelectedIndex={keyboardSelectedIndex}
                         onSectionChange={handleSectionChange}
+                        isHosted={isHosted}
                     />
 
                     <main className="flex h-[600px] flex-1 flex-col overflow-hidden">
@@ -80,6 +83,7 @@ export function SettingsDialog({
                             <SettingsNavMobile
                                 activeSection={activeSection}
                                 onSectionChange={handleSectionChange}
+                                isHosted={isHosted}
                             />
                         </header>
 
@@ -90,9 +94,13 @@ export function SettingsDialog({
                             >
                                 <SettingsContent
                                     activeSection={activeSection}
-                                    initialProviders={initialProviders}
+                                    providers={providers}
+                                    onProvidersChange={onProvidersChange}
+                                    providersLoadFailed={providersLoadFailed}
+                                    onRetryProviders={onRetryProviders}
                                     onReRunOnboarding={onReRunOnboarding}
                                     isHosted={isHosted}
+                                    onPlaudReconnected={onPlaudReconnected}
                                 />
                             </div>
                         </div>

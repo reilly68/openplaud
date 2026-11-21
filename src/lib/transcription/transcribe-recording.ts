@@ -1,7 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
-import { OpenAI } from "openai";
 import { db } from "@/db";
 import {
+    aiEnhancements,
     apiCredentials,
     plaudConnections,
     recordings,
@@ -9,19 +9,52 @@ import {
     userSettings,
 } from "@/db/schema";
 import { generateTitleFromTranscription } from "@/lib/ai/generate-title";
-import { makeNodeFetch } from "@/lib/ai/node-fetch";
-import { getTranscriptionStyle } from "@/lib/ai/provider-presets";
+import { findPreset, getTranscriptionStyle } from "@/lib/ai/provider-presets";
 import { decrypt } from "@/lib/encryption";
 import { decryptText, encryptText } from "@/lib/encryption/fields";
+import { isHostedLockedOut } from "@/lib/entitlements";
+import { env } from "@/lib/env";
+import {
+    isMynahConfigured,
+    transcribeViaMynah,
+} from "@/lib/hosted/transcription/mynah";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
+import {
+    captureServerEvent,
+    captureServerException,
+} from "@/lib/posthog-server";
+import { consumeRateLimitBucket } from "@/lib/rate-limit";
+import {
+    DownloadSizeLimitError,
+    withDownloadedBlobWithLimit,
+} from "@/lib/storage/download-limited";
 import { createUserStorageProvider } from "@/lib/storage/factory";
-import { buildAudioFile } from "@/lib/transcription/audio-file";
+import { generateSummaryForRecording } from "@/lib/summary/generate-summary";
+import {
+    buildAudioFile,
+    getAudioFileMetadata,
+} from "@/lib/transcription/audio-file";
 import { chatTranscribe } from "@/lib/transcription/chat-transcribe";
+import { maybeCompressForWhisper } from "@/lib/transcription/compress-audio";
+import {
+    ELEVENLABS_MAX_FILE_BYTES,
+    ElevenLabsFileTooLargeError,
+    elevenLabsTranscribe,
+} from "@/lib/transcription/elevenlabs-transcribe";
+import {
+    classifyTranscribeError,
+    type TranscribeFailureKind,
+} from "@/lib/transcription/failure-kind";
 import {
     buildTranscriptionParams,
     getResponseFormat,
     parseTranscriptionResponse,
 } from "@/lib/transcription/format";
+import { geminiTranscribe } from "@/lib/transcription/gemini-transcribe";
+import { isRiffadoIncludedProviderId } from "@/lib/transcription/included-provider";
+import { createTranscriptionClient } from "@/lib/transcription/openai-client";
+import { transcribeOpenAIDiarized } from "@/lib/transcription/openai-diarized-transcribe";
+import { upsertTranscription } from "@/lib/transcription/persist";
 import { emitEvent } from "@/lib/webhooks/emit";
 
 /**
@@ -33,7 +66,158 @@ export type TranscribeErrorCode =
     | "RECORDING_NOT_FOUND"
     | "NO_TRANSCRIPTION_PROVIDER"
     | "RECORDING_DELETED"
+    | "HOSTED_LOCKED_OUT"
+    | "MYNAH_BUDGET_EXHAUSTED"
+    | "FILE_TOO_LARGE"
     | "TRANSCRIPTION_FAILED";
+
+export interface StoreBrowserTranscriptionInput {
+    userId: string;
+    recordingId: string;
+    text: string;
+    detectedLanguage: string | null;
+    model: string;
+}
+
+/**
+ * Persist a transcription produced in the browser by Transformers.js.
+ *
+ * Mirrors the persistence half of `transcribeRecording` (tombstone check,
+ * at-rest encryption, upsert, `transcription.completed` event) but skips
+ * the server-side provider call. Auto-generated title and Plaud title
+ * sync are intentionally NOT run from this path; browser-only users
+ * typically have no AI provider configured and the title generation
+ * would silently fail. If a browser-transcribing user later wants a
+ * generated title they can trigger it once they configure an AI key.
+ */
+export async function storeBrowserTranscription(
+    input: StoreBrowserTranscriptionInput,
+): Promise<TranscribeResult> {
+    const { userId, recordingId, text, detectedLanguage, model } = input;
+
+    // Hosted lockout: a lapsed account is read-only, even for the
+    // zero-cost browser path. No-op on self-host.
+    if (await isHostedLockedOut(userId)) {
+        await captureServerEvent({
+            distinctId: userId,
+            event: "hosted_locked_out_attempt",
+            properties: { trigger: "browser" },
+        });
+        return {
+            success: false,
+            error: "Your hosted plan has lapsed. Subscribe to resume transcription.",
+            errorCode: "HOSTED_LOCKED_OUT",
+        };
+    }
+
+    const [recording] = await db
+        .select({ id: recordings.id, deletedAt: recordings.deletedAt })
+        .from(recordings)
+        .where(
+            and(
+                eq(recordings.id, recordingId),
+                eq(recordings.userId, userId),
+                isNull(recordings.deletedAt),
+            ),
+        )
+        .limit(1);
+
+    if (!recording) {
+        return {
+            success: false,
+            error: "Recording not found",
+            errorCode: "RECORDING_NOT_FOUND",
+        };
+    }
+
+    const RECORDING_TOMBSTONED = Symbol("recording-tombstoned");
+    try {
+        await db.transaction(async (tx) => {
+            const [stillActive] = await tx
+                .select({ deletedAt: recordings.deletedAt })
+                .from(recordings)
+                .where(
+                    and(
+                        eq(recordings.id, recordingId),
+                        eq(recordings.userId, userId),
+                    ),
+                )
+                .for("update")
+                .limit(1);
+            if (!stillActive || stillActive.deletedAt) {
+                throw RECORDING_TOMBSTONED;
+            }
+
+            const [existing] = await tx
+                .select({ id: transcriptions.id })
+                .from(transcriptions)
+                .where(
+                    and(
+                        eq(transcriptions.recordingId, recordingId),
+                        eq(transcriptions.userId, userId),
+                    ),
+                )
+                .limit(1);
+
+            const encryptedText = encryptText(text);
+            if (existing) {
+                await tx
+                    .update(transcriptions)
+                    .set({
+                        text: encryptedText,
+                        detectedLanguage,
+                        transcriptionType: "browser",
+                        provider: "browser",
+                        model,
+                    })
+                    .where(
+                        and(
+                            eq(transcriptions.id, existing.id),
+                            eq(transcriptions.userId, userId),
+                        ),
+                    );
+            } else {
+                await tx.insert(transcriptions).values({
+                    recordingId,
+                    userId,
+                    text: encryptedText,
+                    detectedLanguage,
+                    transcriptionType: "browser",
+                    provider: "browser",
+                    model,
+                });
+            }
+
+            await tx
+                .update(recordings)
+                .set({ updatedAt: new Date() })
+                .where(
+                    and(
+                        eq(recordings.id, recordingId),
+                        eq(recordings.userId, userId),
+                        isNull(recordings.deletedAt),
+                    ),
+                );
+        });
+    } catch (txError) {
+        if (txError === RECORDING_TOMBSTONED) {
+            return {
+                success: false,
+                error: "Recording was deleted before transcription finished",
+                errorCode: "RECORDING_DELETED",
+            };
+        }
+        throw txError;
+    }
+
+    await emitEvent("transcription.completed", userId, recordingId);
+    await captureServerEvent({
+        distinctId: userId,
+        event: "recording_transcribed",
+        properties: { trigger: "browser", provider_type: "browser" },
+    });
+    return { success: true, text, detectedLanguage };
+}
 
 export interface TranscribeOptions {
     /** Use a specific provider (by id, user-scoped) instead of the user's default. */
@@ -49,24 +233,78 @@ export interface TranscribeOptions {
      * idempotent.
      */
     force?: boolean;
+    /** What triggered this call. Drives the `recording_transcribed` event's `trigger` property. */
+    trigger?: "manual" | "sync";
 }
 
 export interface TranscribeResult {
     success: boolean;
     error?: string;
     errorCode?: TranscribeErrorCode;
+    /**
+     * Present when the provider call itself failed. Unset for account-level
+     * failures (no provider, lockout, budget) that the user resolves.
+     */
+    failureKind?: TranscribeFailureKind;
+    /** Upstream HTTP status of a failed provider call, when known. */
+    providerStatus?: number;
+    /**
+     * Set with a failed provider call: true when the managed provider
+     * (Mynah) handled it, so a 401/403 is our service token being refused
+     * rather than the user's own key.
+     */
+    managedProvider?: boolean;
     /** Present on success. Plaintext transcript. */
     text?: string;
     /** Present on success when the provider returned a language. */
     detectedLanguage?: string | null;
 }
 
+// Per-recording in-flight dedup within one process. Force and non-force
+// are partitioned so Retry cannot inherit an auto-transcribe skip.
+const inFlightTranscriptions = new Map<string, Promise<TranscribeResult>>();
+
 export async function transcribeRecording(
     userId: string,
     recordingId: string,
     opts: TranscribeOptions = {},
 ): Promise<TranscribeResult> {
+    const key = `${userId}:${recordingId}:${opts.force ? "force" : "auto"}`;
+    const inFlight = inFlightTranscriptions.get(key);
+    if (inFlight) {
+        return inFlight;
+    }
+    const work = transcribeRecordingInner(userId, recordingId, opts);
+    inFlightTranscriptions.set(key, work);
     try {
+        return await work;
+    } finally {
+        inFlightTranscriptions.delete(key);
+    }
+}
+
+async function transcribeRecordingInner(
+    userId: string,
+    recordingId: string,
+    opts: TranscribeOptions = {},
+): Promise<TranscribeResult> {
+    let usedManaged = false;
+    try {
+        // Hosted lockout: a lapsed account is read-only. No-op on
+        // self-host (isHostedLockedOut always false there).
+        if (await isHostedLockedOut(userId)) {
+            await captureServerEvent({
+                distinctId: userId,
+                event: "hosted_locked_out_attempt",
+                properties: { trigger: opts.trigger ?? "manual" },
+            });
+            return {
+                success: false,
+                error: "Your hosted plan has lapsed. Subscribe to resume transcription.",
+                errorCode: "HOSTED_LOCKED_OUT",
+            };
+        }
+
         const [recording] = await db
             .select()
             .from(recordings)
@@ -99,6 +337,12 @@ export async function transcribeRecording(
                 and(
                     eq(transcriptions.recordingId, recordingId),
                     eq(transcriptions.userId, userId),
+                    // Only the user's own ('riffado') transcript gates the
+                    // idempotent short-circuit and forced re-run. A
+                    // Plaud-imported transcript ('plaud') must NOT suppress the
+                    // user's own run, and the user's run must NOT overwrite the
+                    // Plaud row — the two coexist. See #204.
+                    eq(transcriptions.source, "riffado"),
                 ),
             )
             .limit(1);
@@ -117,20 +361,8 @@ export async function transcribeRecording(
             };
         }
 
-        // Provider selection: explicit `providerId` (manual override
-        // from the route, user-scoped lookup by id) takes precedence
-        // over the user's default transcription provider.
-        const [credentials] = opts.providerId
-            ? await db
-                  .select()
-                  .from(apiCredentials)
-                  .where(
-                      and(
-                          eq(apiCredentials.id, opts.providerId),
-                          eq(apiCredentials.userId, userId),
-                      ),
-                  )
-                  .limit(1)
+        const [legacyDefaultCredentials] = opts.providerId
+            ? []
             : await db
                   .select()
                   .from(apiCredentials)
@@ -142,14 +374,6 @@ export async function transcribeRecording(
                   )
                   .limit(1);
 
-        if (!credentials) {
-            return {
-                success: false,
-                error: "No transcription API configured",
-                errorCode: "NO_TRANSCRIPTION_PROVIDER",
-            };
-        }
-
         const [settings] = await db
             .select()
             .from(userSettings)
@@ -159,154 +383,275 @@ export async function transcribeRecording(
         const defaultLanguage =
             settings?.defaultTranscriptionLanguage || undefined;
         const quality = settings?.transcriptionQuality || "balanced";
+        const diarize = settings?.speakerDiarization ?? true;
+        const numSpeakers = settings?.diarizationSpeakerCount ?? undefined;
         const autoGenerateTitle = settings?.autoGenerateTitle ?? true;
         const syncTitleToPlaud = settings?.syncTitleToPlaud ?? false;
+        const autoSummarize = settings?.autoSummarize ?? false;
+        const autoSummarizePreset = settings?.autoSummarizePreset ?? null;
+        const pointer = settings?.defaultTranscriptionProviderId ?? null;
+        const requested = opts.providerId || pointer || null;
+        const useManaged = isRiffadoIncludedProviderId(requested);
 
         void quality;
 
-        const apiKey = decrypt(credentials.apiKey);
-        const openai = new OpenAI({
-            apiKey,
-            baseURL: credentials.baseUrl || undefined,
-            fetch: makeNodeFetch(),
-        });
+        let credentials: typeof apiCredentials.$inferSelect | undefined;
+        if (!useManaged && requested) {
+            [credentials] = await db
+                .select()
+                .from(apiCredentials)
+                .where(
+                    and(
+                        eq(apiCredentials.id, requested),
+                        eq(apiCredentials.userId, userId),
+                    ),
+                )
+                .limit(1);
+        } else if (!useManaged) {
+            credentials = legacyDefaultCredentials;
+        }
 
-        const storage = await createUserStorageProvider(userId);
-        const audioBuffer = await storage.downloadFile(recording.storagePath);
-
-        // `recording.filename` is encrypted at rest; decrypt before passing
-        // to the transcription provider as a filename hint.
-        const decryptedFilename = decryptText(recording.filename);
-        const { file: audioFile, contentType } = buildAudioFile(
-            audioBuffer,
-            recording.storagePath,
-            decryptedFilename,
-        );
-
-        const model = opts.model || credentials.defaultModel || "whisper-1";
-
-        // Chat-style providers (OpenRouter today) don't implement
-        // `/v1/audio/transcriptions` — calling that path returns a 404
-        // with a non-JSON body that crashes the OpenAI SDK's response
-        // parser (issue #122). Route those through chat-completions
-        // with an `input_audio` content part instead.
-        const transcriptionStyle = getTranscriptionStyle(credentials.provider);
+        const runManagedTranscription = async () => {
+            usedManaged = true;
+            const input = {
+                userId,
+                storagePath: recording.storagePath,
+                durationMs: recording.duration,
+                language: defaultLanguage,
+                filename: decryptText(recording.filename),
+            };
+            const result = await transcribeViaMynah(input);
+            return {
+                text: result.text,
+                detectedLanguage: result.detectedLanguage,
+                provider: "mynah",
+                model: "parakeet",
+            };
+        };
 
         let transcriptionText: string;
         let detectedLanguage: string | null;
+        let persistProvider: string;
+        let persistModel: string;
 
-        if (transcriptionStyle === "chat") {
-            const result = await chatTranscribe({
-                client: openai,
-                model,
-                audioBuffer,
-                contentType,
-                language: defaultLanguage,
-            });
-            transcriptionText = result.text;
-            detectedLanguage = result.detectedLanguage;
-        } else {
-            const responseFormat = getResponseFormat(model);
-            const transcription = await openai.audio.transcriptions.create(
-                buildTranscriptionParams({
-                    file: audioFile,
-                    model,
-                    responseFormat,
-                    language: defaultLanguage,
-                }),
-            );
-            const parsed = parseTranscriptionResponse(
-                transcription,
-                responseFormat,
-            );
-            transcriptionText = parsed.text;
-            detectedLanguage = parsed.detectedLanguage;
-        }
-
-        const RECORDING_TOMBSTONED = Symbol("recording-tombstoned");
-        try {
-            await db.transaction(async (tx) => {
-                const [stillActive] = await tx
-                    .select({ deletedAt: recordings.deletedAt })
-                    .from(recordings)
-                    .where(
-                        and(
-                            eq(recordings.id, recordingId),
-                            eq(recordings.userId, userId),
-                        ),
-                    )
-                    .for("update")
-                    .limit(1);
-
-                if (!stillActive || stillActive.deletedAt) {
-                    throw RECORDING_TOMBSTONED;
-                }
-
-                const [currentTranscription] = await tx
-                    .select()
-                    .from(transcriptions)
-                    .where(
-                        and(
-                            eq(transcriptions.recordingId, recordingId),
-                            eq(transcriptions.userId, userId),
-                        ),
-                    )
-                    .limit(1);
-
-                const encryptedTranscriptionText =
-                    encryptText(transcriptionText);
-
-                // Persist the *actual* model used (which may differ from
-                // the provider default when the manual route supplied an
-                // override). Mirrors what the OpenAI request really ran.
-                if (currentTranscription) {
-                    await tx
-                        .update(transcriptions)
-                        .set({
-                            text: encryptedTranscriptionText,
-                            detectedLanguage,
-                            transcriptionType: "server",
-                            provider: credentials.provider,
-                            model,
-                        })
-                        .where(
-                            and(
-                                eq(transcriptions.id, currentTranscription.id),
-                                eq(transcriptions.userId, userId),
-                            ),
-                        );
-                } else {
-                    await tx.insert(transcriptions).values({
-                        recordingId,
-                        userId,
-                        text: encryptedTranscriptionText,
-                        detectedLanguage,
-                        transcriptionType: "server",
-                        provider: credentials.provider,
-                        model,
-                    });
-                }
-
-                await tx
-                    .update(recordings)
-                    .set({ updatedAt: new Date() })
-                    .where(
-                        and(
-                            eq(recordings.id, recordingId),
-                            eq(recordings.userId, userId),
-                            isNull(recordings.deletedAt),
-                        ),
-                    );
-            });
-        } catch (txError) {
-            if (txError === RECORDING_TOMBSTONED) {
+        if (useManaged) {
+            if (!isMynahConfigured()) {
                 return {
                     success: false,
-                    error: "Recording was deleted before transcription finished",
-                    errorCode: "RECORDING_DELETED",
+                    error: "No transcription API configured",
+                    errorCode: "NO_TRANSCRIPTION_PROVIDER",
                 };
             }
-            throw txError;
+            const result = await runManagedTranscription();
+            transcriptionText = result.text;
+            detectedLanguage = result.detectedLanguage;
+            persistProvider = result.provider;
+            persistModel = result.model;
+        } else if (credentials) {
+            const apiKey = decrypt(credentials.apiKey);
+
+            // Route based on the provider's transcription style:
+            // - "gemini": Google Gemini native generateContent API (inlineData)
+            // - "elevenlabs": ElevenLabs Scribe /v1/speech-to-text (xi-api-key,
+            //   diarized words[] response)
+            // - "chat": OpenAI-compatible chat completions with input_audio
+            //   (OpenRouter today; #122 -- /v1/audio/transcriptions 404s there)
+            // - "whisper": OpenAI-compatible /v1/audio/transcriptions
+            const transcriptionStyle = getTranscriptionStyle(
+                credentials.provider,
+            );
+
+            if (
+                transcriptionStyle === "elevenlabs" &&
+                recording.filesize > ELEVENLABS_MAX_FILE_BYTES
+            ) {
+                throw new ElevenLabsFileTooLargeError(recording.filesize);
+            }
+
+            const storage = await createUserStorageProvider(userId);
+            const decryptedFilename = decryptText(recording.filename);
+            const model =
+                opts.model ||
+                credentials.defaultModel ||
+                findPreset(credentials.provider)?.defaultModel ||
+                "whisper-1";
+            persistProvider = credentials.provider;
+            persistModel = model;
+
+            if (transcriptionStyle === "elevenlabs") {
+                try {
+                    const result = await withDownloadedBlobWithLimit(
+                        storage,
+                        recording.storagePath,
+                        ELEVENLABS_MAX_FILE_BYTES,
+                        async ({ blob, header }) => {
+                            const metadata = getAudioFileMetadata(
+                                header,
+                                recording.storagePath,
+                                decryptedFilename,
+                            );
+                            const file = new File([blob], metadata.filename, {
+                                type: metadata.contentType,
+                            });
+                            return elevenLabsTranscribe({
+                                apiKey,
+                                model,
+                                file,
+                                baseUrl: credentials.baseUrl,
+                                isHosted: env.IS_HOSTED,
+                                language: defaultLanguage,
+                                diarize,
+                                numSpeakers,
+                                timeoutMs: env.WHISPER_REQUEST_TIMEOUT_MS,
+                            });
+                        },
+                    );
+                    transcriptionText = result.text;
+                    detectedLanguage = result.detectedLanguage;
+                } catch (err) {
+                    if (err instanceof DownloadSizeLimitError) {
+                        throw new ElevenLabsFileTooLargeError();
+                    }
+                    throw err;
+                }
+            } else {
+                const audioBuffer = await storage.downloadFile(
+                    recording.storagePath,
+                );
+                const { file: audioFile, contentType } = buildAudioFile(
+                    audioBuffer,
+                    recording.storagePath,
+                    decryptedFilename,
+                );
+
+                if (transcriptionStyle === "gemini") {
+                    const result = await geminiTranscribe({
+                        apiKey,
+                        model,
+                        audioBuffer,
+                        contentType,
+                        language: defaultLanguage,
+                        timeoutMs: env.WHISPER_REQUEST_TIMEOUT_MS,
+                    });
+                    transcriptionText = result.text;
+                    detectedLanguage = result.detectedLanguage;
+                } else {
+                    const openai = createTranscriptionClient({
+                        apiKey,
+                        baseURL: credentials.baseUrl || undefined,
+                        timeoutMs: env.WHISPER_REQUEST_TIMEOUT_MS,
+                    });
+
+                    if (transcriptionStyle === "chat") {
+                        const result = await chatTranscribe({
+                            client: openai,
+                            model,
+                            audioBuffer,
+                            contentType,
+                            language: defaultLanguage,
+                        });
+                        transcriptionText = result.text;
+                        detectedLanguage = result.detectedLanguage;
+                    } else {
+                        const responseFormat = getResponseFormat(model);
+
+                        if (responseFormat === "diarized_json") {
+                            const parsed = await transcribeOpenAIDiarized({
+                                client: openai,
+                                model,
+                                audioBuffer,
+                                durationMs: recording.duration,
+                                filename: decryptedFilename,
+                                language: defaultLanguage,
+                                timeoutMs: env.WHISPER_REQUEST_TIMEOUT_MS,
+                            });
+                            transcriptionText = parsed.text;
+                            detectedLanguage = parsed.detectedLanguage;
+                        } else {
+                            const compressed = await maybeCompressForWhisper(
+                                audioBuffer,
+                                contentType,
+                            );
+                            const fileToSend = compressed.compressed
+                                ? buildAudioFile(
+                                      compressed.buffer,
+                                      recording.storagePath,
+                                      decryptedFilename,
+                                  ).file
+                                : audioFile;
+
+                            const transcription =
+                                await openai.audio.transcriptions.create(
+                                    buildTranscriptionParams({
+                                        file: fileToSend,
+                                        model,
+                                        responseFormat,
+                                        language: defaultLanguage,
+                                    }),
+                                    { timeout: env.WHISPER_REQUEST_TIMEOUT_MS },
+                                );
+                            const parsed = parseTranscriptionResponse(
+                                transcription,
+                                responseFormat,
+                            );
+                            transcriptionText = parsed.text;
+                            detectedLanguage = parsed.detectedLanguage;
+                        }
+                    }
+                }
+            }
+        } else {
+            if (requested || !isMynahConfigured()) {
+                return {
+                    success: false,
+                    error: "No transcription API configured",
+                    errorCode: "NO_TRANSCRIPTION_PROVIDER",
+                };
+            }
+            const result = await runManagedTranscription();
+            transcriptionText = result.text;
+            detectedLanguage = result.detectedLanguage;
+            persistProvider = result.provider;
+            persistModel = result.model;
+        }
+
+        // Persist the user's own ('riffado') transcript via the shared,
+        // tombstone-aware, source-scoped upsert. The persisted model is the
+        // *actual* model used (may differ from the provider default when the
+        // manual route supplied an override).
+        const { committed } = await upsertTranscription({
+            userId,
+            recordingId,
+            text: transcriptionText,
+            detectedLanguage,
+            source: "riffado",
+            provider: persistProvider,
+            model: persistModel,
+        });
+
+        if (!committed) {
+            return {
+                success: false,
+                error: "Recording was deleted before transcription finished",
+                errorCode: "RECORDING_DELETED",
+            };
+        }
+
+        // Re-transcribe path: the previous transcript is being overwritten,
+        // so any existing summary now references stale source text. Drop it
+        // so readers never see "fresh transcript + old summary". If
+        // auto-summarize is on, a fresh summary is generated below;
+        // otherwise the recording shows no summary until the user clicks
+        // "Generate summary" manually.
+        if (existingTranscription?.text && opts.force) {
+            await db
+                .delete(aiEnhancements)
+                .where(
+                    and(
+                        eq(aiEnhancements.recordingId, recordingId),
+                        eq(aiEnhancements.userId, userId),
+                    ),
+                );
         }
 
         if (autoGenerateTitle && transcriptionText.trim()) {
@@ -343,11 +688,8 @@ export async function transcribeRecording(
                                 .limit(1);
 
                             if (connection) {
-                                const plaudClient = await createPlaudClient(
-                                    connection.bearerToken,
-                                    connection.apiBase,
-                                    connection.workspaceId,
-                                );
+                                const plaudClient =
+                                    await createPlaudClient(connection);
                                 await plaudClient.updateFilename(
                                     recording.plaudFileId,
                                     generatedTitle,
@@ -403,6 +745,64 @@ export async function transcribeRecording(
         }
 
         await emitEvent("transcription.completed", userId, recordingId);
+        await captureServerEvent({
+            distinctId: userId,
+            event: "recording_transcribed",
+            properties: {
+                trigger: opts.trigger ?? "manual",
+                provider_type:
+                    persistProvider === "mynah" ? "mynah" : "own_key",
+                detected_language: detectedLanguage ?? null,
+            },
+        });
+
+        if (autoSummarize) {
+            // Per-user hourly cap on auto-summary calls. Cheap defense
+            // against runaway provider cost if a sync replays N
+            // recordings or the user toggles auto-summarize on with an
+            // expensive model. The manual "Generate summary" button is
+            // not throttled -- the user is in the loop there.
+            const rateLimit = await consumeRateLimitBucket(
+                `auto-summary:user:${userId}`,
+                {
+                    limit: env.AUTO_SUMMARY_RATE_LIMIT_PER_HOUR,
+                    windowMs: 60 * 60 * 1000,
+                },
+            );
+
+            if (!rateLimit.allowed) {
+                console.warn(
+                    `Auto-summary rate limit hit for user ${userId} (recording ${recordingId})`,
+                );
+                await emitEvent("summary.failed", userId, recordingId, {
+                    error: `Auto-summary rate limit exceeded (${env.AUTO_SUMMARY_RATE_LIMIT_PER_HOUR}/hour). Manual summary still works.`,
+                });
+            } else {
+                // Run summarization synchronously so the `summary.completed`
+                // event (and the underlying summary write) lands before
+                // downstream consumers that listen for it. A failure here
+                // must not roll back the transcript itself -- the user
+                // still wants the transcript even if the summary call dies.
+                try {
+                    await generateSummaryForRecording(userId, recordingId, {
+                        presetId: autoSummarizePreset ?? undefined,
+                        trigger: "auto",
+                    });
+                    await emitEvent("summary.completed", userId, recordingId);
+                } catch (error) {
+                    console.error(
+                        `Auto-summarize failed for recording ${recordingId}:`,
+                        error,
+                    );
+                    await emitEvent("summary.failed", userId, recordingId, {
+                        error:
+                            error instanceof Error
+                                ? error.message
+                                : String(error),
+                    });
+                }
+            }
+        }
 
         return {
             success: true,
@@ -411,6 +811,38 @@ export async function transcribeRecording(
         };
     } catch (error) {
         console.error("Error transcribing recording:", error);
+        if (isMynahBudgetExhausted(error)) {
+            await emitEvent("transcription.failed", userId, recordingId, {
+                error: "included_transcription_budget_exhausted",
+            });
+            await captureServerEvent({
+                distinctId: userId,
+                event: "mynah_budget_exhausted",
+                properties: { trigger: opts.trigger ?? "manual" },
+            });
+            return {
+                success: false,
+                error: "You've used all of your included Mynah transcription for this cycle. It resets next cycle, or add your own AI provider to keep transcribing.",
+                errorCode: "MYNAH_BUDGET_EXHAUSTED",
+            };
+        }
+        const failure = classifyTranscribeError(error);
+        if (error instanceof ElevenLabsFileTooLargeError) {
+            await emitEvent("transcription.failed", userId, recordingId, {
+                error: error.message,
+            });
+            return {
+                success: false,
+                error: error.message,
+                errorCode: "FILE_TOO_LARGE",
+                failureKind: failure.kind,
+            };
+        }
+        captureServerException(error, {
+            source: "transcription",
+            distinctId: userId,
+            trigger: opts.trigger ?? "manual",
+        });
         await emitEvent("transcription.failed", userId, recordingId, {
             error: error instanceof Error ? error.message : String(error),
         });
@@ -419,6 +851,13 @@ export async function transcribeRecording(
             error:
                 error instanceof Error ? error.message : "Transcription failed",
             errorCode: "TRANSCRIPTION_FAILED",
+            failureKind: failure.kind,
+            providerStatus: failure.status,
+            managedProvider: usedManaged,
         };
     }
+}
+
+function isMynahBudgetExhausted(error: unknown): boolean {
+    return error instanceof Error && error.name === "MynahBudgetExhaustedError";
 }

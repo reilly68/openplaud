@@ -3,21 +3,24 @@ version: '3.8'
 services:
   db:
     image: postgres:16-alpine
-    container_name: openplaud-db
+    container_name: riffado-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      # Default preserved for backward compat with existing self-host
-      # deploys. The one-line installer (scripts/install.sh) generates a
-      # random POSTGRES_PASSWORD and writes it to .env. Existing operators
-      # can rotate by setting POSTGRES_PASSWORD in .env, recreating the
-      # `db` volume, and restoring from a backup.
+      # Unset defaults to `postgres` so existing volumes still start
+      # (Postgres applies POSTGRES_PASSWORD only on first init). New
+      # installs via scripts/install.sh write a random value to .env.
+      # Rotate in place, do not recreate the db volume:
+      #   openssl rand -hex 24
+      #   docker compose exec db psql -U postgres -c "ALTER USER postgres WITH PASSWORD '<value>'"
+      #   set POSTGRES_PASSWORD=<value> in .env
+      #   docker compose up -d --force-recreate app
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: openplaud
+      POSTGRES_DB: riffado
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -29,38 +32,65 @@ services:
     #   - `latest`  → newest stable release (recommended)
     #   - `0.1.0`   → pin to a specific version
     #   - `dev`     → rolling build from `main` (unstable, opt-in)
-    # Override via OPENPLAUD_VERSION in .env. For local builds, see docker-compose.dev.yml.
-    image: ghcr.io/openplaud/openplaud:${OPENPLAUD_VERSION:-latest}
-    container_name: openplaud-app
+    # Override via RIFFADO_VERSION in .env. For local builds, see docker-compose.dev.yml.
+    image: ghcr.io/riffado/riffado:${RIFFADO_VERSION:-latest}
+    container_name: riffado-app
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      # Host port. The one-line installer sets APP_PORT from APP_URL.
+      - "${APP_PORT:-3000}:3000"
     environment:
       # Database
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/openplaud
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/riffado
 
       # Auth
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
       APP_URL: ${APP_URL:-http://localhost:3000}
       DISABLE_REGISTRATION: ${DISABLE_REGISTRATION:-}
 
+      # Maximum duration of each server transcription request, including its response body.
+      WHISPER_REQUEST_TIMEOUT_MS: ${WHISPER_REQUEST_TIMEOUT_MS:-3600000}
+
       # Encryption
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
 
       # Storage (optional defaults)
       DEFAULT_STORAGE_TYPE: ${DEFAULT_STORAGE_TYPE:-local}
+      LOCAL_STORAGE_PATH: ${LOCAL_STORAGE_PATH:-/app/audio}
       S3_ENDPOINT: ${S3_ENDPOINT:-}
       S3_BUCKET: ${S3_BUCKET:-}
       S3_REGION: ${S3_REGION:-}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+
+      # SMTP (optional: password reset + email notifications)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_SECURE: ${SMTP_SECURE:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_MARKETING_FROM: ${SMTP_MARKETING_FROM:-}
+      SMTP_REPLY_TO: ${SMTP_REPLY_TO:-}
+
+      # Transcription (optional): `off` sends original audio to self-hosted
+      # Whisper-compatible servers instead of re-encoding above 25 MiB.
+      WHISPER_COMPRESS: ${WHISPER_COMPRESS:-auto}
+
+      # Status checks (optional): bearer token for GET /api/status/<part>
+      STATUS_TOKEN: ${STATUS_TOKEN:-}
     volumes:
+      # Official compose defaults LOCAL_STORAGE_PATH to /app/audio.
+      # The app default without that override is ./storage → /app/storage
+      # in this image (WORKDIR /app). Persist both so neither path is
+      # wiped on container recreate.
       - audio:/app/audio
+      - storage:/app/storage
     depends_on:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      test: ["CMD", "node", "-e", "const e=process.env.HOSTNAME;const h=(!e||e==='0.0.0.0')?'127.0.0.1':e;const p=parseInt(process.env.PORT,10)||3000;const r=require('http').get('http://'+h+':'+p+'/api/health',s=>process.exit(s.statusCode===200?0:1));r.on('error',()=>process.exit(1));r.setTimeout(2500,()=>{r.destroy();process.exit(1)})"]
       interval: 30s
       timeout: 3s
       start_period: 30s
@@ -70,4 +100,6 @@ volumes:
   pgdata:
     driver: local
   audio:
+    driver: local
+  storage:
     driver: local

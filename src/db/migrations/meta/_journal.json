@@ -162,6 +162,139 @@
       "when": 1778498592155,
       "tag": "0022_icy_norman_osborn",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1779721528953,
+      "tag": "0023_ordinary_roxanne_simpson",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1780126747513,
+      "tag": "0024_sour_serpent_society",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1783013166299,
+      "tag": "0025_ambiguous_black_bird",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1783426525823,
+      "tag": "0026_kind_argent",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1783584444573,
+      "tag": "0027_parched_true_believers",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1783587599807,
+      "tag": "0028_awesome_agent_zero",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1783590934141,
+      "tag": "0029_milky_black_panther",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1783593085542,
+      "tag": "0030_nasty_bloodstorm",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1783618614230,
+      "tag": "0031_goofy_jimmy_woo",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1783855328816,
+      "tag": "0032_open_reaper",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1783855760404,
+      "tag": "0033_tough_typhoid_mary",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1783940484705,
+      "tag": "0034_little_loa",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1784656848456,
+      "tag": "0035_peaceful_hairball",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1785145753255,
+      "tag": "0036_wide_raider",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1785230494218,
+      "tag": "0037_thankful_silver_samurai",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1789279683722,
+      "tag": "0038_secret_the_fallen",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1794993103103,
+      "tag": "0039_wealthy_gambit",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1795011471174,
+      "tag": "0040_eager_annihilus",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1795047684163,
+      "tag": "0041_steep_colossus",
+      "breakpoints": true
     }
   ]
 }

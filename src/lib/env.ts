@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isValidCalendarDateString } from "./date-validation";
 
 const optionalStrictBoolean = z
     .string()
@@ -15,41 +16,25 @@ const optionalStrictBoolean = z
         return z.NEVER;
     });
 
-export const envSchema = z.object({
-    // Deployment mode. `true` means this instance is the OpenPlaud-operated
-    // hosted product (marketing landing visible at `/`). Default `false`:
-    // self-host instances skip the marketing surface and bounce logged-out
-    // visitors at `/` straight to `/login`.
+const baseEnvSchema = z.object({
+    /** True for the Riffado-operated hosted instance; default false (self-host). */
     IS_HOSTED: z
         .string()
         .optional()
         .transform((val) => val === "true"),
 
-    // Disable email/password sign-up. When `true`, the better-auth
-    // sign-up endpoint is disabled server-side (security boundary), the
-    // /register page renders a disabled-state panel, and the /login page
-    // hides its register link. Operator-controlled, defaults to `false`
-    // (registration open). Self-host only -- the OpenPlaud-operated hosted
-    // instance leaves this unset.
+    /** Disable email/password sign-up. */
     DISABLE_REGISTRATION: z
         .string()
         .optional()
         .transform((val) => val === "true"),
 
-    // Disable the self-host update-available check (GitHub releases API).
-    // When `true`, the footer never reaches out to api.github.com to look
-    // for a newer release tag. Useful for instances with strict egress
-    // controls or operators who don't want any phone-home behavior.
-    // Defaults to `false` (check enabled). Inert when IS_HOSTED=true --
-    // the hosted instance hides the badge unconditionally because the
-    // operator (us) controls deploys.
+    /** Disable the self-host update-available check. */
     DISABLE_UPDATE_CHECK: z
         .string()
         .optional()
         .transform((val) => val === "true"),
 
-    // Server-required values are optional at schema level so that `next build`
-    // (phase-production-build) doesn't depend on server-only secrets.
     DATABASE_URL: z.string().optional(),
 
     BETTER_AUTH_SECRET: z.string().optional(),
@@ -62,17 +47,33 @@ export const envSchema = z.object({
         }),
     APP_URL: z.string().url("APP_URL must be a valid URL").optional(),
 
-    // Webhook target hardening. Unset means default to IS_HOSTED; explicit
-    // false keeps self-host integrations like Docker service hostnames working.
+    /** Require public HTTPS webhook targets. Defaults to IS_HOSTED. */
     WEBHOOKS_REQUIRE_PUBLIC_TARGETS: optionalStrictBoolean,
 
-    // Only enable when a trusted reverse proxy strips or overwrites incoming
-    // client-supplied forwarding headers before requests reach Next.js.
+    /** Trust X-Forwarded-For for IP rate limiting; only enable behind a trusted proxy. */
     RATE_LIMIT_TRUST_PROXY_HEADERS: optionalStrictBoolean,
 
-    // Encryption
-    // Optional at env-schema level so that builds don't fail if it's missing;
-    // encryption code is responsible for enforcing a strong key at runtime.
+    /**
+     * Bearer token for the status checks at GET /api/status/<part>. Unset
+     * (default) makes those endpoints 404 and turns all status recording off.
+     * A malformed value (under 32 characters or containing whitespace) is
+     * treated as unset, with a warning that never includes the value.
+     */
+    STATUS_TOKEN: z
+        .string()
+        .optional()
+        .transform((val) => {
+            const trimmed = val?.trim();
+            if (!trimmed) return undefined;
+            if (trimmed.length < 32 || /\s/.test(trimmed)) {
+                console.warn(
+                    "[status] STATUS_TOKEN is set but invalid (it needs at least 32 characters and no whitespace); status checks stay disabled.",
+                );
+                return undefined;
+            }
+            return trimmed;
+        }),
+
     ENCRYPTION_KEY: z.string().optional(),
 
     DEFAULT_STORAGE_TYPE: z.enum(["local", "s3"]).optional().default("local"),
@@ -83,35 +84,24 @@ export const envSchema = z.object({
     S3_ACCESS_KEY_ID: z.string().optional(),
     S3_SECRET_ACCESS_KEY: z.string().optional(),
 
-    // Webshare residential-proxy API key. When set, Plaud-bound outbound
-    // requests (api*.plaud.ai, resource.plaud.ai) are routed through a
-    // random valid proxy from the Webshare list, with automatic rotation
-    // on Cloudflare 403/407 responses. Unset (default) keeps every call
-    // on the direct egress path — the right default for self-hosters on
-    // residential or homelab IPs that Cloudflare doesn't flag. Hosted
-    // deployments on flagged datacenter ASNs (Contabo, OVH, …) need this.
-    // See src/lib/plaud/proxy.ts for the rationale.
+    /**
+     * Optional Webshare API key. When set, Plaud-bound outbound requests are
+     * routed through a proxy from the configured Webshare account. Unset
+     * (default) keeps every call on the direct egress path.
+     */
     WEBSHARE_API_KEY: z
         .string()
         .optional()
         .transform((val) => (val === "" ? undefined : val)),
 
-    // Scope of the Webshare proxy. "all" (default) routes every Plaud
-    // outbound (API + signed-URL audio CDN) through the proxy. "api-only"
-    // skips proxying resource.plaud.ai signed-URL downloads, sending
-    // those direct from the server's egress IP. Audio bytes dominate
-    // proxy bandwidth, so flipping this to api-only on hosted can save
-    // most of the Webshare quota -- BUT only do so after verifying with
-    // scripts/plaud-egress-probe.sh that resource.plaud.ai actually
-    // serves direct from your egress IPs. Inert when WEBSHARE_API_KEY
-    // is unset (no proxy is used at all).
+    /**
+     * Which Plaud hosts route through the proxy. `all` (default) includes
+     * `resource.plaud.ai` audio downloads; `api-only` skips them.
+     * Inert when WEBSHARE_API_KEY is unset.
+     */
     PLAUD_PROXY_SCOPE: z.enum(["all", "api-only"]).optional().default("all"),
 
-    // Per-user rate limit on POST /api/plaud/sync, in requests per minute.
-    // Defaults to 10. Backstops the client-side manual-sync floor and
-    // cross-tab dedup: even if a script hammers the endpoint, the bucket
-    // throttles it before any Plaud or Webshare call is issued. Set lower
-    // for tighter quotas, higher for power users. Range 1..600.
+    /** Per-user rate limit on POST /api/plaud/sync. Default 10, range 1..600. */
     PLAUD_SYNC_RATE_LIMIT_PER_MINUTE: z
         .string()
         .regex(
@@ -120,6 +110,114 @@ export const envSchema = z.object({
         )
         .optional()
         .transform((val) => (val ? Number(val) : 10))
+        .pipe(z.number().int().positive().max(600)),
+
+    /**
+     * Master switch for the server-side background sync worker (#159).
+     * Default true. Set false to opt out entirely -- e.g. a self-hoster who
+     * wants sync to happen only when they have the app open, or who wants to
+     * control Plaud API call timing themselves (cron hitting `POST
+     * /api/plaud/sync`, per the issue's alternative ask). No effect on the
+     * client-side `useAutoSync` polling, which is unaffected either way.
+     * Rejects anything other than "true"/"false"/unset so a typo (e.g.
+     * "flase") fails loudly instead of silently leaving sync enabled.
+     */
+    BACKGROUND_SYNC_ENABLED: z
+        .string()
+        .optional()
+        .transform((val, ctx) => {
+            if (val === undefined || val === "") return true;
+            if (val === "true") return true;
+            if (val === "false") return false;
+
+            ctx.addIssue({
+                code: "custom",
+                message:
+                    'BACKGROUND_SYNC_ENABLED must be either "true" or "false"',
+            });
+            return z.NEVER;
+        }),
+
+    /**
+     * Tick interval (ms) for the server-side background sync worker, which
+     * polls Plaud and processes new recordings independently of any open
+     * browser tab (#159). Default 5 min, range 1..60 min. Runs for all users
+     * on self-host; hosted restricts eligibility to `hosted_pro`. Note the
+     * worker also skips any user synced in the last 4 minutes (regardless of
+     * this interval), so setting this below 4 min doesn't sync any given
+     * user more often -- it only makes the worker tick (and query the
+     * database) more frequently for no benefit.
+     */
+    BACKGROUND_SYNC_INTERVAL_MS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BACKGROUND_SYNC_INTERVAL_MS must be a positive integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 5 * 60 * 1000))
+        .pipe(
+            z
+                .number()
+                .int()
+                .min(60_000)
+                .max(60 * 60_000),
+        ),
+
+    /** Compress OpenAI-style transcription inputs above this byte threshold. */
+    WHISPER_MAX_BYTES: z
+        .string()
+        .regex(/^\d+$/, "WHISPER_MAX_BYTES must be a positive integer")
+        .optional()
+        .transform((val) => (val ? Number(val) : 24 * 1024 * 1024))
+        .pipe(
+            z
+                .number()
+                .int()
+                .positive()
+                .max(25 * 1024 * 1024),
+        ),
+
+    /**
+     * `auto` (default) re-encodes OpenAI-style transcription inputs above
+     * WHISPER_MAX_BYTES; `off` always sends the original file. Use `off` with a
+     * self-hosted Whisper-compatible server that has no 25 MiB request cap, where
+     * the re-encode only costs accuracy and CPU.
+     */
+    WHISPER_COMPRESS: z.enum(["auto", "off"]).optional().default("auto"),
+
+    /** Starting mono Opus bitrate for oversized transcription inputs. */
+    WHISPER_COMPRESS_BITRATE_KBPS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "WHISPER_COMPRESS_BITRATE_KBPS must be a positive integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 12))
+        .pipe(z.number().int().positive()),
+
+    /** OpenAI-compatible transcription request timeout (Whisper and chat-style). */
+    WHISPER_REQUEST_TIMEOUT_MS: z
+        .string()
+        .regex(/^\d+$/, "WHISPER_REQUEST_TIMEOUT_MS must be a positive integer")
+        .optional()
+        .transform((val) => (val ? Number(val) : 60 * 60 * 1000))
+        .pipe(z.number().int().positive()),
+
+    // Per-user hourly cap on auto-generated summaries (post-transcription
+    // path only -- the manual "Generate summary" button is not throttled).
+    // Defaults to 60/hour. Caps the cost blast radius if a misconfigured
+    // sync replays N recordings or an upstream provider keeps a quota
+    // alive but degraded. Range 1..600.
+    AUTO_SUMMARY_RATE_LIMIT_PER_HOUR: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "AUTO_SUMMARY_RATE_LIMIT_PER_HOUR must be a positive integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 60))
         .pipe(z.number().int().positive().max(600)),
 
     SMTP_HOST: z.string().optional(),
@@ -133,12 +231,23 @@ export const envSchema = z.object({
         .transform((val) => val === "true"),
     SMTP_USER: z.string().optional(),
     SMTP_PASSWORD: z.string().optional(),
-    // Rybbit analytics (hosted mode only). Both must be set together for
-    // the tracking script and proxy rewrites to activate. Self-host leaves
-    // them unset; the analytics component returns null and no rewrites are
-    // registered, so no requests go to Rybbit at all.
-    RYBBIT_SITE_ID: z.string().optional(),
-    RYBBIT_HOST: z.string().url("RYBBIT_HOST must be a valid URL").optional(),
+    /**
+     * Open Analytics (hosted only). Inert unless both the tracking key
+     * and host are set. Script is `${OA_HOST}/oa.js`; collector is
+     * OA_HOST. Cookieless (`data-storage="none"`); not gated on a banner.
+     */
+    OA_TRACKING_KEY: z.string().optional(),
+    OA_HOST: z.string().url("OA_HOST must be a valid URL").optional(),
+
+    /**
+     * PostHog analytics (hosted-only, hard-gated on IS_HOSTED regardless of
+     * whether this is set -- self-host never sends events to Riffado's
+     * PostHog project). The project token; ingest host is hardcoded to the
+     * EU cluster in src/lib/posthog-server.ts and src/lib/posthog/proxy.ts
+     * -- Riffado only ever uses PostHog EU, so there's no second region to
+     * make configurable. Inert unless this is set.
+     */
+    POSTHOG_KEY: z.string().optional(),
 
     SMTP_FROM: z
         .string()
@@ -156,13 +265,11 @@ export const envSchema = z.object({
             },
         ),
 
-    // Admin dashboard (hosted-only). All three are inert when IS_HOSTED is
-    // unset/false -- the admin gate trips before any of these are read.
-    //
-    // ADMIN_EMAILS: comma-separated allowlist of operator email addresses.
-    // Lower-cased and trimmed at parse time. Empty => no admins (default).
-    // Source of truth for admin identity; intentionally out of the DB so a
-    // DB compromise alone does not grant admin.
+    /**
+     * Hosted-only admin dashboard config. Inert when IS_HOSTED is unset.
+     * `ADMIN_EMAILS`: comma-separated allowlist of operator emails (source of
+     * truth for admin identity, kept out of the DB).
+     */
     ADMIN_EMAILS: z
         .string()
         .optional()
@@ -173,9 +280,7 @@ export const envSchema = z.object({
             }),
         ),
 
-    // ADMIN_IP_ALLOWLIST: optional comma-separated CIDR list. When set, admin
-    // routes 404 for requests whose client IP isn't in the list. Empty/unset
-    // disables the check (relying on the auth + reauth chain instead).
+    /** Optional CIDR allowlist for /admin/*. Empty/unset disables the check. */
     ADMIN_IP_ALLOWLIST: z
         .string()
         .optional()
@@ -186,13 +291,7 @@ export const envSchema = z.object({
             }),
         ),
 
-    // ADMIN_REAUTH_TTL_MINUTES: how long an admin's elevated cookie is valid
-    // after password reprompt before the dashboard forces another reauth.
-    // Default 30. Mutations require the cookie to be issued within the last
-    // ADMIN_MUTATION_TTL_MINUTES (default 10) -- a tighter window than reads.
-    // TTLs validated as strict positive integers. The leading regex
-    // rejects malformed values (`parseInt("30abc")` would silently coerce
-    // to 30); the .pipe(z.number()...) clamps to a sane range.
+    /** Admin reauth cookie TTL (minutes). Default 30, max 1440. */
     ADMIN_REAUTH_TTL_MINUTES: z
         .string()
         .regex(/^\d+$/, "ADMIN_REAUTH_TTL_MINUTES must be a positive integer")
@@ -205,12 +304,454 @@ export const envSchema = z.object({
                 .positive()
                 .max(24 * 60),
         ),
+    /** Tighter TTL required for admin mutations (minutes). Default 10, max 60. */
     ADMIN_MUTATION_TTL_MINUTES: z
         .string()
         .regex(/^\d+$/, "ADMIN_MUTATION_TTL_MINUTES must be a positive integer")
         .optional()
         .transform((val) => (val ? Number(val) : 10))
         .pipe(z.number().int().positive().max(60)),
+
+    ADMIN_HOSTNAME: z
+        .string()
+        .optional()
+        .transform((val) => {
+            const trimmed = val?.trim().toLowerCase();
+            return trimmed ? trimmed : undefined;
+        })
+        .refine(
+            (val) =>
+                val === undefined ||
+                /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(
+                    val,
+                ),
+            {
+                message:
+                    "ADMIN_HOSTNAME must be a bare hostname (e.g., admin.riffado.com) -- no scheme, port, or path",
+            },
+        ),
+
+    REACHER_API_URL: z
+        .string()
+        .url("REACHER_API_URL must be a valid URL")
+        .optional()
+        .default("https://check-if-email-exists.stacked.rest/v0/check_email"),
+    REACHER_API_KEY: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    SMTP_MARKETING_FROM: z
+        .string()
+        .optional()
+        .refine(
+            (val) => {
+                if (!val) return true;
+                const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                const nameEmailRegex = /^.+ <[^\s@]+@[^\s@]+\.[^\s@]+>$/;
+                return emailRegex.test(val) || nameEmailRegex.test(val);
+            },
+            {
+                message:
+                    'SMTP_MARKETING_FROM must be an email address (e.g., "user@example.com") or formatted as "Name <user@example.com>"',
+            },
+        ),
+
+    /**
+     * Reply-To address applied to every outbound email (transactional,
+     * marketing, and announcement). Distinct from SMTP_FROM/SMTP_MARKETING_FROM
+     * -- lets the From: address stay a no-reply/branded sender while replies
+     * land in a monitored inbox. Unset means no Reply-To header is added.
+     */
+    SMTP_REPLY_TO: z
+        .string()
+        .optional()
+        .refine(
+            (val) => {
+                if (!val) return true;
+                const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                const nameEmailRegex = /^.+ <[^\s@]+@[^\s@]+\.[^\s@]+>$/;
+                return emailRegex.test(val) || nameEmailRegex.test(val);
+            },
+            {
+                message:
+                    'SMTP_REPLY_TO must be an email address (e.g., "user@example.com") or formatted as "Name <user@example.com>"',
+            },
+        ),
+
+    EMAIL_SEND_RATE_PER_SECOND: z
+        .string()
+        .regex(/^\d+$/, "EMAIL_SEND_RATE_PER_SECOND must be a positive integer")
+        .optional()
+        .transform((val) => (val ? Number(val) : 5))
+        .pipe(z.number().int().positive().max(100)),
+
+    STRIPE_SECRET_KEY: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val))
+        .refine(
+            (val) =>
+                val === undefined ||
+                val.startsWith("sk_test_") ||
+                val.startsWith("sk_live_") ||
+                val.startsWith("rk_test_") ||
+                val.startsWith("rk_live_"),
+            {
+                message:
+                    "STRIPE_SECRET_KEY must start with 'sk_'/'rk_' and 'test_'/'live_'",
+            },
+        ),
+
+    /** Stripe webhook signing secret (whsec_...). Required iff BILLING_ENABLED. */
+    STRIPE_WEBHOOK_SECRET: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the monthly USD Pro plan. */
+    STRIPE_PRICE_ID_USD: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the monthly EUR Pro plan. */
+    STRIPE_PRICE_ID_EUR: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the standard monthly USD Pro plan after founding capacity is gone. */
+    STRIPE_STANDARD_PRICE_ID_USD: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the standard monthly EUR Pro plan after founding capacity is gone. */
+    STRIPE_STANDARD_PRICE_ID_EUR: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the annual USD Pro plan. */
+    STRIPE_PRICE_ID_USD_ANNUAL: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the annual EUR Pro plan. */
+    STRIPE_PRICE_ID_EUR_ANNUAL: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Historical Stripe Price ids that grant Pro but are not used for Checkout. */
+    STRIPE_LEGACY_PRO_PRICE_IDS: z
+        .string()
+        .optional()
+        .transform((val) =>
+            (val ?? "").split(",").flatMap((entry) => {
+                const trimmed = entry.trim();
+                return trimmed ? [trimmed] : [];
+            }),
+        ),
+
+    /**
+     * Stripe Customer Portal configuration id (bpc_...). Optional -- when
+     * unset the portal falls back to the account's default configuration.
+     * Set it to pin the exact features (update card, invoices, cancel at
+     * period end) regardless of the dashboard default.
+     */
+    STRIPE_PORTAL_CONFIGURATION_ID: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /**
+     * Trusted edge header carrying the buyer's ISO-3166-1 alpha-2 country,
+     * used only to pick presentment currency (EU/EEA -> EUR, else default).
+     * The edge must strip client-supplied values before injecting it. When
+     * unset, checkout uses BILLING_DEFAULT_CURRENCY.
+     */
+    GEO_COUNTRY_HEADER: z
+        .string()
+        .optional()
+        .transform((val) =>
+            val && val.trim() !== "" ? val.trim().toLowerCase() : undefined,
+        ),
+
+    /**
+     * Master gate for the hosted billing surface. When false (default),
+     * billing routes 404, checkout UI hides, cycle-close worker no-ops.
+     * Self-host always leaves this unset.
+     */
+    BILLING_ENABLED: optionalStrictBoolean,
+
+    /** Mynah transcription proxy base URL. Required iff BILLING_ENABLED. */
+    MYNAH_BASE_URL: z
+        .string()
+        .url("MYNAH_BASE_URL must be a valid URL")
+        .optional()
+        .transform((val) =>
+            val && val.trim() !== ""
+                ? val.trim().replace(/\/+$/, "")
+                : undefined,
+        ),
+
+    /** Shared service token for Mynah. Required iff BILLING_ENABLED. */
+    MYNAH_SERVICE_TOKEN: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Mynah-seconds budget per cycle for hosted_pro. Default 54000 (15hr). */
+    BILLING_PRO_INCLUDED_SECONDS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BILLING_PRO_INCLUDED_SECONDS must be a non-negative integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 54_000))
+        .pipe(z.number().int().nonnegative()),
+
+    /** Mynah-seconds budget per cycle for hosted_free. Default 0; set to 1800 for the OD-1 free 30min allotment. */
+    BILLING_FREE_INCLUDED_SECONDS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BILLING_FREE_INCLUDED_SECONDS must be a non-negative integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 1800))
+        .pipe(z.number().int().nonnegative()),
+
+    /** Maximum number of users who can ever claim founding monthly pricing. */
+    BILLING_FOUNDING_MEMBER_CAPACITY: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BILLING_FOUNDING_MEMBER_CAPACITY must be a positive integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 100))
+        .pipe(z.number().int().positive().max(100000)),
+
+    /** Display price for the founding monthly USD Pro plan (decimal string). Keep in sync with STRIPE_PRICE_ID_USD. */
+    BILLING_PRICE_USD: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_PRICE_USD must be a decimal string with two digits after the point (e.g. '5.00')",
+        )
+        .optional()
+        .default("5.00"),
+
+    /** Display price for the founding monthly EUR Pro plan (decimal string). Keep in sync with STRIPE_PRICE_ID_EUR. */
+    BILLING_PRICE_EUR: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_PRICE_EUR must be a decimal string with two digits after the point (e.g. '5.00')",
+        )
+        .optional()
+        .default("5.00"),
+
+    /** Display price for the standard monthly USD Pro plan. */
+    BILLING_STANDARD_PRICE_USD: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_STANDARD_PRICE_USD must be a decimal string with two digits after the point (e.g. '9.00')",
+        )
+        .optional()
+        .default("9.00"),
+
+    /** Display price for the standard monthly EUR Pro plan. */
+    BILLING_STANDARD_PRICE_EUR: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_STANDARD_PRICE_EUR must be a decimal string with two digits after the point (e.g. '9.00')",
+        )
+        .optional()
+        .default("9.00"),
+
+    /** Optional display price for the annual USD Pro plan. */
+    BILLING_PRICE_USD_ANNUAL: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_PRICE_USD_ANNUAL must be a decimal string with two digits after the point (e.g. '60.00')",
+        )
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Optional display price for the annual EUR Pro plan. */
+    BILLING_PRICE_EUR_ANNUAL: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_PRICE_EUR_ANNUAL must be a decimal string with two digits after the point (e.g. '60.00')",
+        )
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Fallback currency when geo is unknown (worker emails, no-geo checkout). */
+    BILLING_DEFAULT_CURRENCY: z.enum(["usd", "eur"]).optional().default("usd"),
+
+    /** Display billing interval for the Pro plan (e.g. '1 month'). The Stripe Price is authoritative. */
+    BILLING_PRO_INTERVAL: z
+        .string()
+        .regex(
+            /^\d+\s+(day|week|month|year)s?$/i,
+            "BILLING_PRO_INTERVAL must look like 'N day|week|month|year(s)'",
+        )
+        .optional()
+        .default("1 month"),
+
+    /** Local display description for the Pro plan. */
+    BILLING_PRO_DESCRIPTION: z
+        .string()
+        .min(1)
+        .max(255)
+        .optional()
+        .default("Riffado Hosted Pro"),
+
+    /**
+     * Trial length in days for new hosted sign-ups. All hosted accounts
+     * start as Pro for this window. After it, accounts with a
+     * card-on-file get charged automatically; accounts without one drop
+     * into the trial-grace state.
+     */
+    BILLING_TRIAL_DAYS: z
+        .string()
+        .regex(/^\d+$/, "BILLING_TRIAL_DAYS must be a non-negative integer")
+        .optional()
+        .transform((val) => (val ? Number(val) : 14)),
+
+    /**
+     * Grace period in days for accounts that never converted from trial
+     * to paid. After this window, the account is hard-deleted.
+     */
+    BILLING_TRIAL_GRACE_DAYS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BILLING_TRIAL_GRACE_DAYS must be a non-negative integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 7)),
+
+    /**
+     * Grace period in days for accounts that were paying customers and
+     * later lapsed (canceled / payment-failed-out). Strictly larger
+     * window than the trial grace since these users built a real
+     * relationship and may want to come back.
+     */
+    BILLING_PAID_GRACE_DAYS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BILLING_PAID_GRACE_DAYS must be a non-negative integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 30)),
+
+    /**
+     * Hosted billing launch date (ISO `YYYY-MM-DD`). Users whose
+     * `createdAt` predates this are grandfathered as Path B (paid)
+     * grace policy regardless of payment history. Also used to gate
+     * the founding-member window.
+     */
+    BILLING_LAUNCH_DATE: z
+        .string()
+        .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            "BILLING_LAUNCH_DATE must be an ISO date (YYYY-MM-DD)",
+        )
+        .refine(isValidCalendarDateString, {
+            message:
+                "BILLING_LAUNCH_DATE must be a real calendar date (YYYY-MM-DD)",
+        })
+        .optional(),
+});
+
+export const envSchema = baseEnvSchema.superRefine((parsed, ctx) => {
+    const annualConfigPresent = Boolean(
+        parsed.STRIPE_PRICE_ID_USD_ANNUAL ||
+            parsed.STRIPE_PRICE_ID_EUR_ANNUAL ||
+            parsed.BILLING_PRICE_USD_ANNUAL ||
+            parsed.BILLING_PRICE_EUR_ANNUAL,
+    );
+    if (annualConfigPresent) {
+        const currencies = [
+            {
+                monthlyId: parsed.STRIPE_PRICE_ID_USD,
+                annualId: parsed.STRIPE_PRICE_ID_USD_ANNUAL,
+                annualAmount: parsed.BILLING_PRICE_USD_ANNUAL,
+                idField: "STRIPE_PRICE_ID_USD_ANNUAL",
+                amountField: "BILLING_PRICE_USD_ANNUAL",
+                label: "USD",
+            },
+            {
+                monthlyId: parsed.STRIPE_PRICE_ID_EUR,
+                annualId: parsed.STRIPE_PRICE_ID_EUR_ANNUAL,
+                annualAmount: parsed.BILLING_PRICE_EUR_ANNUAL,
+                idField: "STRIPE_PRICE_ID_EUR_ANNUAL",
+                amountField: "BILLING_PRICE_EUR_ANNUAL",
+                label: "EUR",
+            },
+        ] as const;
+
+        for (const currency of currencies) {
+            if (
+                !currency.monthlyId &&
+                (currency.annualId || currency.annualAmount)
+            ) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: [currency.idField],
+                    message: `Annual ${currency.label} billing requires the monthly ${currency.label} Price`,
+                });
+            }
+            if (currency.monthlyId && !currency.annualId) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: [currency.idField],
+                    message: `Annual billing requires an annual Price for every supported monthly currency (${currency.label} missing)`,
+                });
+            }
+            if (currency.monthlyId && !currency.annualAmount) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: [currency.amountField],
+                    message: `Annual billing requires a display amount for every supported monthly currency (${currency.label} missing)`,
+                });
+            }
+        }
+    }
+
+    const currentPriceIds = [
+        parsed.STRIPE_PRICE_ID_USD,
+        parsed.STRIPE_PRICE_ID_EUR,
+        parsed.STRIPE_STANDARD_PRICE_ID_USD,
+        parsed.STRIPE_STANDARD_PRICE_ID_EUR,
+        parsed.STRIPE_PRICE_ID_USD_ANNUAL,
+        parsed.STRIPE_PRICE_ID_EUR_ANNUAL,
+    ].flatMap((priceId) => (priceId ? [priceId] : []));
+    if (
+        parsed.STRIPE_LEGACY_PRO_PRICE_IDS.some((priceId) =>
+            currentPriceIds.includes(priceId),
+        )
+    ) {
+        ctx.addIssue({
+            code: "custom",
+            path: ["STRIPE_LEGACY_PRO_PRICE_IDS"],
+            message:
+                "STRIPE_LEGACY_PRO_PRICE_IDS must not include current Stripe Price ids",
+        });
+    }
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -236,6 +777,7 @@ function validateEnv(): Env {
                 process.env.WEBHOOKS_REQUIRE_PUBLIC_TARGETS,
             RATE_LIMIT_TRUST_PROXY_HEADERS:
                 process.env.RATE_LIMIT_TRUST_PROXY_HEADERS,
+            STATUS_TOKEN: process.env.STATUS_TOKEN,
             ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
             DEFAULT_STORAGE_TYPE: process.env.DEFAULT_STORAGE_TYPE,
             LOCAL_STORAGE_PATH: process.env.LOCAL_STORAGE_PATH,
@@ -248,11 +790,22 @@ function validateEnv(): Env {
             PLAUD_PROXY_SCOPE: process.env.PLAUD_PROXY_SCOPE,
             PLAUD_SYNC_RATE_LIMIT_PER_MINUTE:
                 process.env.PLAUD_SYNC_RATE_LIMIT_PER_MINUTE,
+            BACKGROUND_SYNC_ENABLED: process.env.BACKGROUND_SYNC_ENABLED,
+            BACKGROUND_SYNC_INTERVAL_MS:
+                process.env.BACKGROUND_SYNC_INTERVAL_MS,
+            WHISPER_MAX_BYTES: process.env.WHISPER_MAX_BYTES,
+            WHISPER_COMPRESS: process.env.WHISPER_COMPRESS,
+            WHISPER_COMPRESS_BITRATE_KBPS:
+                process.env.WHISPER_COMPRESS_BITRATE_KBPS,
+            WHISPER_REQUEST_TIMEOUT_MS: process.env.WHISPER_REQUEST_TIMEOUT_MS,
+            AUTO_SUMMARY_RATE_LIMIT_PER_HOUR:
+                process.env.AUTO_SUMMARY_RATE_LIMIT_PER_HOUR,
             SMTP_HOST: process.env.SMTP_HOST,
             SMTP_PORT: process.env.SMTP_PORT,
             SMTP_SECURE: process.env.SMTP_SECURE,
-            RYBBIT_SITE_ID: process.env.RYBBIT_SITE_ID,
-            RYBBIT_HOST: process.env.RYBBIT_HOST,
+            OA_TRACKING_KEY: process.env.OA_TRACKING_KEY,
+            OA_HOST: process.env.OA_HOST,
+            POSTHOG_KEY: process.env.POSTHOG_KEY,
             SMTP_USER: process.env.SMTP_USER,
             SMTP_PASSWORD: process.env.SMTP_PASSWORD,
             SMTP_FROM: process.env.SMTP_FROM,
@@ -260,16 +813,54 @@ function validateEnv(): Env {
             ADMIN_IP_ALLOWLIST: process.env.ADMIN_IP_ALLOWLIST,
             ADMIN_REAUTH_TTL_MINUTES: process.env.ADMIN_REAUTH_TTL_MINUTES,
             ADMIN_MUTATION_TTL_MINUTES: process.env.ADMIN_MUTATION_TTL_MINUTES,
+            ADMIN_HOSTNAME: process.env.ADMIN_HOSTNAME,
+            REACHER_API_URL: process.env.REACHER_API_URL,
+            REACHER_API_KEY: process.env.REACHER_API_KEY,
+            SMTP_MARKETING_FROM: process.env.SMTP_MARKETING_FROM,
+            SMTP_REPLY_TO: process.env.SMTP_REPLY_TO,
+            EMAIL_SEND_RATE_PER_SECOND: process.env.EMAIL_SEND_RATE_PER_SECOND,
+            STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY,
+            STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET,
+            STRIPE_PRICE_ID_USD: process.env.STRIPE_PRICE_ID_USD,
+            STRIPE_PRICE_ID_EUR: process.env.STRIPE_PRICE_ID_EUR,
+            STRIPE_STANDARD_PRICE_ID_USD:
+                process.env.STRIPE_STANDARD_PRICE_ID_USD,
+            STRIPE_STANDARD_PRICE_ID_EUR:
+                process.env.STRIPE_STANDARD_PRICE_ID_EUR,
+            STRIPE_PRICE_ID_USD_ANNUAL: process.env.STRIPE_PRICE_ID_USD_ANNUAL,
+            STRIPE_PRICE_ID_EUR_ANNUAL: process.env.STRIPE_PRICE_ID_EUR_ANNUAL,
+            STRIPE_LEGACY_PRO_PRICE_IDS:
+                process.env.STRIPE_LEGACY_PRO_PRICE_IDS,
+            STRIPE_PORTAL_CONFIGURATION_ID:
+                process.env.STRIPE_PORTAL_CONFIGURATION_ID,
+            BILLING_ENABLED: process.env.BILLING_ENABLED,
+            MYNAH_BASE_URL: process.env.MYNAH_BASE_URL,
+            MYNAH_SERVICE_TOKEN: process.env.MYNAH_SERVICE_TOKEN,
+            BILLING_PRO_INCLUDED_SECONDS:
+                process.env.BILLING_PRO_INCLUDED_SECONDS,
+            BILLING_FREE_INCLUDED_SECONDS:
+                process.env.BILLING_FREE_INCLUDED_SECONDS,
+            BILLING_FOUNDING_MEMBER_CAPACITY:
+                process.env.BILLING_FOUNDING_MEMBER_CAPACITY,
+            BILLING_PRICE_USD: process.env.BILLING_PRICE_USD,
+            BILLING_PRICE_EUR: process.env.BILLING_PRICE_EUR,
+            BILLING_STANDARD_PRICE_USD: process.env.BILLING_STANDARD_PRICE_USD,
+            BILLING_STANDARD_PRICE_EUR: process.env.BILLING_STANDARD_PRICE_EUR,
+            BILLING_PRICE_USD_ANNUAL: process.env.BILLING_PRICE_USD_ANNUAL,
+            BILLING_PRICE_EUR_ANNUAL: process.env.BILLING_PRICE_EUR_ANNUAL,
+            BILLING_DEFAULT_CURRENCY: process.env.BILLING_DEFAULT_CURRENCY,
+            BILLING_PRO_INTERVAL: process.env.BILLING_PRO_INTERVAL,
+            BILLING_PRO_DESCRIPTION: process.env.BILLING_PRO_DESCRIPTION,
+            BILLING_TRIAL_DAYS: process.env.BILLING_TRIAL_DAYS,
+            BILLING_TRIAL_GRACE_DAYS: process.env.BILLING_TRIAL_GRACE_DAYS,
+            BILLING_PAID_GRACE_DAYS: process.env.BILLING_PAID_GRACE_DAYS,
+            BILLING_LAUNCH_DATE: process.env.BILLING_LAUNCH_DATE,
         });
 
-        // In runtime (dev/prod servers), we require a strong encryption key.
-        // During `next build` (phase-production-build) we skip this so that
-        // server-only config doesn't break the frontend build.
         const isProductionBuildPhase =
             process.env.NEXT_PHASE === "phase-production-build";
 
         if (!isProductionBuildPhase) {
-            // Core server-side envs must be present when the server actually runs.
             if (!parsed.DATABASE_URL) {
                 throw new Error(
                     "DATABASE_URL must be set in non-build runtime (dev/prod server)",
@@ -293,6 +884,50 @@ function validateEnv(): Env {
                 );
             }
 
+            if (parsed.BILLING_ENABLED && !parsed.IS_HOSTED) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires IS_HOSTED=true; billing is a hosted-only surface",
+                );
+            }
+            if (parsed.BILLING_ENABLED && !parsed.STRIPE_SECRET_KEY) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires STRIPE_SECRET_KEY to be set",
+                );
+            }
+            if (parsed.BILLING_ENABLED && !parsed.STRIPE_WEBHOOK_SECRET) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires STRIPE_WEBHOOK_SECRET to be set",
+                );
+            }
+            if (
+                parsed.BILLING_ENABLED &&
+                !parsed.STRIPE_STANDARD_PRICE_ID_USD &&
+                !parsed.STRIPE_STANDARD_PRICE_ID_EUR
+            ) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires at least one of STRIPE_STANDARD_PRICE_ID_USD / STRIPE_STANDARD_PRICE_ID_EUR for post-founding monthly checkout",
+                );
+            }
+            if (
+                parsed.BILLING_ENABLED &&
+                !parsed.STRIPE_PRICE_ID_USD &&
+                !parsed.STRIPE_PRICE_ID_EUR
+            ) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires at least one of STRIPE_PRICE_ID_USD / STRIPE_PRICE_ID_EUR for founding monthly checkout",
+                );
+            }
+            if (parsed.BILLING_ENABLED && !parsed.MYNAH_BASE_URL) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires MYNAH_BASE_URL to be set",
+                );
+            }
+            if (parsed.BILLING_ENABLED && !parsed.MYNAH_SERVICE_TOKEN) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires MYNAH_SERVICE_TOKEN to be set",
+                );
+            }
+
             if (
                 parsed.IS_HOSTED &&
                 parsed.RATE_LIMIT_TRUST_PROXY_HEADERS !== true
@@ -302,7 +937,22 @@ function validateEnv(): Env {
                 );
             }
 
-            // Encryption key: required and strong at runtime, ignored during build.
+            if (parsed.ADMIN_HOSTNAME && parsed.APP_URL) {
+                let appHost: string;
+                try {
+                    appHost = new URL(parsed.APP_URL).hostname.toLowerCase();
+                } catch {
+                    throw new Error(
+                        "APP_URL must be a valid URL when ADMIN_HOSTNAME is set",
+                    );
+                }
+                if (appHost === parsed.ADMIN_HOSTNAME) {
+                    throw new Error(
+                        `ADMIN_HOSTNAME (${parsed.ADMIN_HOSTNAME}) must differ from APP_URL host (${appHost}). Configure a dedicated subdomain such as admin.${appHost}.`,
+                    );
+                }
+            }
+
             const key = parsed.ENCRYPTION_KEY;
             if (!key) {
                 throw new Error(

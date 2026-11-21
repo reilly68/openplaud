@@ -25,6 +25,7 @@ import {
     findPreset,
     getVisiblePresets,
     isLocalPreset,
+    supportsEnhancement,
 } from "@/lib/ai/provider-presets";
 
 interface Provider {
@@ -59,7 +60,7 @@ export function EditProviderDialog({
     const visiblePresets = getVisiblePresets({ isHosted });
     // Legacy case: a hosted user has an existing LM Studio / Ollama provider
     // (added before hosted enforcement, or imported). Keep their currently
-    // selected preset visible in the dropdown — disabled — so the Select
+    // selected preset visible in the dropdown, disabled, so the Select
     // doesn't render an empty trigger. The save will still fail server-side
     // because the stored baseUrl is loopback; we surface a notice so the
     // user knows to delete and re-add with a public endpoint.
@@ -81,7 +82,10 @@ export function EditProviderDialog({
             setBaseUrl(provider.baseUrl || "");
             setDefaultModel(provider.defaultModel || "");
             setIsDefaultTranscription(provider.isDefaultTranscription);
-            setIsDefaultEnhancement(provider.isDefaultEnhancement);
+            setIsDefaultEnhancement(
+                supportsEnhancement(provider.provider) &&
+                    provider.isDefaultEnhancement,
+            );
             setApiKey("");
         } else if (!open) {
             setProviderName("");
@@ -217,10 +221,10 @@ export function EditProviderDialog({
                                 <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
                                 <span>
                                     {legacyLocalProvider} isn&apos;t usable on
-                                    the hosted app — we can&apos;t reach your
+                                    the hosted app. We can&apos;t reach your
                                     machine. Delete this provider and re-add one
-                                    with a public endpoint, or self-host
-                                    OpenPlaud (
+                                    with a public endpoint, or self-host Riffado
+                                    (
                                     <code className="font-mono">
                                         docker compose up
                                     </code>
@@ -270,7 +274,7 @@ export function EditProviderDialog({
                                 We can&apos;t reach{" "}
                                 <code className="font-mono">localhost</code> or
                                 other private addresses from the hosted app. To
-                                use LM Studio or Ollama, self-host OpenPlaud (
+                                use LM Studio or Ollama, self-host Riffado (
                                 <code className="font-mono">
                                     docker compose up
                                 </code>
@@ -307,10 +311,18 @@ export function EditProviderDialog({
                                 onChange={(e) =>
                                     setIsDefaultEnhancement(e.target.checked)
                                 }
-                                disabled={isLoading}
+                                disabled={
+                                    isLoading ||
+                                    !supportsEnhancement(provider.provider)
+                                }
                             />
                             <span>Use for AI enhancements</span>
                         </label>
+                        {!supportsEnhancement(provider.provider) && (
+                            <p className="text-xs text-muted-foreground pl-6">
+                                {provider.provider} transcribes only.
+                            </p>
+                        )}
                     </Panel>
 
                     <div className="flex gap-2">

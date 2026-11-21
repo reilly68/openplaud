@@ -1,17 +1,38 @@
+import { sql } from "drizzle-orm";
 import {
+    bigint,
     boolean,
+    date,
     index,
     integer,
     jsonb,
     pgEnum,
     pgTable,
+    primaryKey,
     real,
     text,
     timestamp,
     unique,
+    uniqueIndex,
     varchar,
 } from "drizzle-orm/pg-core";
 import { nanoid } from "nanoid";
+
+export const userPlanEnum = pgEnum("user_plan", [
+    "self_host",
+    "hosted_free",
+    "hosted_pro",
+]);
+
+export const foundingMemberReservationStatusEnum = pgEnum(
+    "founding_member_reservation_status",
+    ["reserved", "consumed", "released", "expired"],
+);
+
+export const stripeWebhookEventStatusEnum = pgEnum(
+    "stripe_webhook_event_status",
+    ["pending", "processing", "completed", "failed"],
+);
 
 // Better Auth tables (handled by Better Auth)
 export const users = pgTable("users", {
@@ -30,6 +51,38 @@ export const users = pgTable("users", {
     // is locked behind IS_HOSTED.
     suspendedAt: timestamp("suspended_at"),
     suspendedReason: text("suspended_reason"),
+    marketingEmailConsent: boolean("marketing_email_consent")
+        .notNull()
+        .default(false),
+    // Hosted billing plan. NULL on self-host and for hosted users created
+    // before the billing rollout (backfilled by scripts/billing-backfill.ts).
+    plan: userPlanEnum("plan"),
+    // Set by the billing rollout backfill to (launch_date + 30 days) for
+    // every pre-launch hosted user. While > now(), enforcement skips caps.
+    planTransitionUntil: timestamp("plan_transition_until"),
+    // Per-cycle Mynah transcription budget in seconds. Reset by cycle-close.
+    monthlyMynahSecondsRemaining: integer("monthly_mynah_seconds_remaining")
+        .notNull()
+        .default(0),
+    // Next time cycle-close should refresh the Mynah counter. NULL = never.
+    monthlyMynahGrantResetAt: timestamp("monthly_mynah_grant_reset_at"),
+    // True while the user currently retains founding monthly pricing. Cleared
+    // when they cancel/lapse; the separate claimed timestamp is never cleared
+    // so the first-100 capacity does not reopen.
+    foundingMember: boolean("founding_member").notNull().default(false),
+    foundingMemberClaimedAt: timestamp("founding_member_claimed_at"),
+    // First time the user was successfully charged. NULL = never paid.
+    // Used to branch the grace-period policy on lapse:
+    //  - NULL (trial non-convert) -> BILLING_TRIAL_GRACE_DAYS (7)
+    //  - set (former paying user)  -> BILLING_PAID_GRACE_DAYS (30)
+    // Grandfather: pre-launch users are treated as Path B (paid) by checking
+    // `createdAt < BILLING_LAUNCH_DATE` at deletion-scheduling time, so this
+    // column staying NULL for grandfathered users is intentional.
+    everPaidAt: timestamp("ever_paid_at"),
+    // When the user enters a lapsed state (trial ended w/o payment, sub
+    // canceled/failed-out, etc.) this is set to now() + grace_days. The
+    // billing worker deletes the account at that time. Cleared on reactivate.
+    accountDeletionScheduledAt: timestamp("account_deletion_scheduled_at"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
@@ -155,8 +208,19 @@ export const plaudConnections = pgTable("plaud_connections", {
     userId: text("user_id")
         .notNull()
         .references(() => users.id, { onDelete: "cascade" }),
-    // Encrypted bearer token (long-lived ≈300 days per Plaud's JWT claims)
+    // Encrypted Plaud user token (UT). Lifetime varies by source: 24 hours
+    // from the Plaud web app cookie, 30 days from the email-code login, and
+    // ~300 days for legacy tokens issued before Plaud added refresh tokens.
     bearerToken: text("bearer_token").notNull(),
+    // Encrypted Plaud refresh token, used to mint a fresh UT before it
+    // expires. Null for legacy and pasted connections. A refresh never moves
+    // sessionExpiresAt later than the stored value.
+    refreshToken: text("refresh_token"),
+    // When the stored UT expires. Null when unknown.
+    accessExpiresAt: timestamp("access_expires_at"),
+    // When the Plaud sign-in ends for good (refresh token expiry, else UT
+    // expiry). The user must reconnect after this. Null when unknown.
+    sessionExpiresAt: timestamp("session_expires_at"),
     // Regional API server base URL (e.g. https://api-euc1.plaud.ai for EU users)
     apiBase: text("api_base").notNull().default("https://api.plaud.ai"),
     // Email of the linked Plaud account (captured during OTP flow). Null for
@@ -169,6 +233,12 @@ export const plaudConnections = pgTable("plaud_connections", {
     // Null for connections created before this column existed; resolved and
     // persisted lazily on next sync.
     workspaceId: text("workspace_id"),
+    // Set when Plaud rejects the stored token during sync (HTTP 401 ->
+    // PLAUD_INVALID_TOKEN), meaning the user must reconnect. Cleared on the
+    // next successful sync (self-healing on transient 401s) and on reconnect.
+    // Distinct from deleting the row: the connection and synced recordings
+    // stay put so reconnect is a modal, not re-onboarding.
+    invalidatedAt: timestamp("invalidated_at"),
     lastSync: timestamp("last_sync"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
@@ -210,7 +280,7 @@ export const recordings = pgTable(
             .notNull()
             .references(() => users.id, { onDelete: "cascade" }),
         deviceSn: varchar("device_sn", { length: 255 }).notNull(),
-        // Unique ID from Plaud API, scoped per OpenPlaud user.
+        // Unique ID from Plaud API, scoped per Riffado user.
         plaudFileId: varchar("plaud_file_id", { length: 255 }).notNull(),
         filename: text("filename").notNull(),
         duration: integer("duration").notNull(), // milliseconds
@@ -238,7 +308,7 @@ export const recordings = pgTable(
         // audio reconstruction is possible from these values.
         waveformPeaks: jsonb("waveform_peaks"),
         // Soft-delete tombstone. Set when the user deletes a recording from
-        // OpenPlaud's UI. Sync skips tombstoned rows so re-syncing from Plaud
+        // Riffado's UI. Sync skips tombstoned rows so re-syncing from Plaud
         // does not resurrect deleted recordings. The audio file is hard-deleted
         // from storage at delete time; this row is retained only as a marker
         // keyed by plaudFileId. See issue #56.
@@ -284,6 +354,11 @@ export const transcriptions = pgTable(
             .default("server"), // 'server' or 'browser'
         provider: varchar("provider", { length: 100 }).notNull(), // e.g., 'openai', 'groq', 'browser'
         model: varchar("model", { length: 100 }).notNull(), // e.g., 'whisper-1', 'whisper-large-v3-turbo', 'whisper-base'
+        // Provenance of this transcript, orthogonal to transcriptionType:
+        //   'riffado' = produced by the user's own provider (server/browser)
+        //   'plaud'   = imported from Plaud's native transcription
+        //   'mixed'   = user-edited combination of the above (see #204)
+        source: varchar("source", { length: 20 }).notNull().default("riffado"),
         createdAt: timestamp("created_at").notNull().defaultNow(),
     },
     (table) => ({
@@ -293,6 +368,12 @@ export const transcriptions = pgTable(
         ),
         // Index for querying user's transcriptions
         userIdIdx: index("transcriptions_user_id_idx").on(table.userId),
+        // At most one transcript per (recording, user, source) so a
+        // Plaud-imported transcript and the user's own provider can coexist
+        // while each source still upserts cleanly.
+        recordingUserSourceUnique: unique(
+            "transcriptions_recording_user_source_unique",
+        ).on(table.recordingId, table.userId, table.source),
     }),
 );
 
@@ -314,6 +395,9 @@ export const aiEnhancements = pgTable(
         keyPoints: jsonb("key_points"), // Array of key points
         provider: varchar("provider", { length: 100 }).notNull(), // e.g., 'openai', 'anthropic-via-openrouter'
         model: varchar("model", { length: 100 }).notNull(), // e.g., 'gpt-4o', 'claude-3.5-sonnet'
+        // Provenance: 'riffado' = generated by the user's provider,
+        // 'plaud' = imported from Plaud's native summary.
+        source: varchar("source", { length: 20 }).notNull().default("riffado"),
         createdAt: timestamp("created_at").notNull().defaultNow(),
     },
     (table) => ({
@@ -348,22 +432,6 @@ export const apiCredentials = pgTable("api_credentials", {
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
-// Storage Configuration
-export const storageConfig = pgTable("storage_config", {
-    id: text("id")
-        .primaryKey()
-        .$defaultFn(() => nanoid()),
-    userId: text("user_id")
-        .notNull()
-        .unique()
-        .references(() => users.id, { onDelete: "cascade" }),
-    storageType: varchar("storage_type", { length: 10 }).notNull(), // 'local' or 's3'
-    // Encrypted S3 config (if s3): { endpoint, bucket, region, accessKeyId, secretAccessKey }
-    s3Config: jsonb("s3_config"),
-    createdAt: timestamp("created_at").notNull().defaultNow(),
-    updatedAt: timestamp("updated_at").notNull().defaultNow(),
-});
-
 // User Settings
 export const userSettings = pgTable("user_settings", {
     id: text("id")
@@ -377,6 +445,14 @@ export const userSettings = pgTable("user_settings", {
     syncInterval: integer("sync_interval").notNull().default(300000),
     // Auto-transcribe new recordings
     autoTranscribe: boolean("auto_transcribe").notNull().default(false),
+    // Auto-summarize after a successful transcription (manual, post-sync
+    // auto, or re-transcribe). Runs the same summary pipeline as the
+    // manual button. Orthogonal to autoTranscribe -- fires on any
+    // successful transcription, not just auto-transcribed ones.
+    autoSummarize: boolean("auto_summarize").notNull().default(false),
+    // Preset id override for the auto-summary path. Null inherits
+    // summaryPrompt.selectedPrompt (the manual default).
+    autoSummarizePreset: text("auto_summarize_preset"),
     // Sync settings
     autoSyncEnabled: boolean("auto_sync_enabled").notNull().default(true),
     syncOnMount: boolean("sync_on_mount").notNull().default(true),
@@ -402,6 +478,35 @@ export const userSettings = pgTable("user_settings", {
     transcriptionQuality: varchar("transcription_quality", { length: 20 })
         .notNull()
         .default("balanced"), // 'fast', 'balanced', 'accurate'
+    // Speaker diarization. Only providers with a diarizing surface honor
+    // this (ElevenLabs Scribe today); Whisper-style providers ignore it.
+    speakerDiarization: boolean("speaker_diarization").notNull().default(true),
+    // Optional speaker-count hint, 1..32. Null lets the provider decide.
+    diarizationSpeakerCount: integer("diarization_speaker_count"),
+    // Plaud-native content import (feature #204). When enabled, sync imports
+    // Plaud's own transcript/summary (source='plaud') for recordings Plaud
+    // has already processed, instead of only the audio.
+    importPlaudContent: boolean("import_plaud_content")
+        .notNull()
+        .default(false),
+    // When a Plaud transcript is imported, whether the user's own provider
+    // also runs: 'plaud_only' suppresses it (saves AI credits); 'keep_both'
+    // also transcribes so both coexist for comparison.
+    transcriptMode: varchar("transcript_mode", { length: 20 })
+        .notNull()
+        .default("plaud_only"), // 'plaud_only' | 'keep_both'
+    // Which transcript is primary in singular contexts (recording detail,
+    // summary input, v1 `transcript`, webhooks) when multiple sources exist.
+    preferredTranscriptSource: varchar("preferred_transcript_source", {
+        length: 20,
+    })
+        .notNull()
+        .default("plaud"), // 'plaud' | 'riffado'
+    // Authoritative default transcription provider: an api_credentials id,
+    // the managed "riffado-included" sentinel, or null (no explicit choice
+    // -> hosted managed fallback). Supersedes the per-row
+    // api_credentials.is_default_transcription boolean for selection.
+    defaultTranscriptionProviderId: text("default_transcription_provider_id"),
     // Display/UI settings
     dateTimeFormat: varchar("date_time_format", { length: 20 })
         .notNull()
@@ -558,6 +663,128 @@ export const webhookDeliveries = pgTable(
     }),
 );
 
+export const exportJobStatusEnum = pgEnum("export_job_status", [
+    "pending",
+    "processing",
+    "completed",
+    "failed",
+]);
+
+/**
+ * A queued request to build a full-data archive (audio + transcript +
+ * summary per recording, zipped) for one user. Built asynchronously by
+ * the worker in `src/lib/export/worker.ts` -- creating this row must
+ * stay cheap; all the heavy lifting (streaming audio out of storage,
+ * zipping, streaming the archive back into storage) happens off the
+ * request thread.
+ *
+ * `storageKey` + `expiresAt` are only set once `status = 'completed'`.
+ * The cleanup pass in the same worker deletes the archive from storage
+ * and the row once `expiresAt` has passed, so archives don't accumulate
+ * storage cost indefinitely.
+ */
+export const exportJobs = pgTable(
+    "export_jobs",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        userId: text("user_id")
+            .notNull()
+            .references(() => users.id, { onDelete: "cascade" }),
+        status: exportJobStatusEnum("status").notNull().default("pending"),
+        storageKey: text("storage_key"),
+        // bigint, not integer: a full-library archive (audio for every
+        // recording, uncompressed) can exceed 2^31-1 bytes (~2GB) well
+        // within the hosted_pro 50GB storage cap.
+        fileSize: bigint("file_size", { mode: "number" }),
+        recordingCount: integer("recording_count"),
+        errorMessage: text("error_message"),
+        // Bumped on every failed build attempt. Once it reaches the
+        // worker's max-attempts constant, a failure sticks as `failed`
+        // instead of being requeued to `pending` -- bounds retries for a
+        // job that's failing for a durable reason (not just a transient
+        // blip) instead of retrying it forever.
+        attempts: integer("attempts").notNull().default(0),
+        // Random token stamped on every claim (`claimPendingExportJobs`).
+        // A worker may only complete/fail the specific claim it holds --
+        // every write is scoped `where id = ... and claim_token = ...`.
+        // This is what makes the stale-processing reclaim safe even
+        // though it can't distinguish "process crashed" from "still
+        // running, just slow": if a reclaimed job's original (zombie)
+        // worker eventually finishes and tries to write, its claim token
+        // no longer matches (the reclaim cleared it), so the write
+        // affects zero rows instead of corrupting whatever the new
+        // claim has since done with the job.
+        claimToken: text("claim_token"),
+        // Storage keys from abandoned attempts (per-claim-token keys --
+        // see `claimToken` above -- from claims reclaimed as stale,
+        // i.e. the worker holding them almost certainly crashed
+        // mid-build). Nothing else ever looks these up once the claim
+        // is cleared, so without tracking them here they'd be permanent
+        // storage leaks: `reclaimStaleProcessingExportJobs` appends the
+        // abandoned key here before clearing `claimToken`, and the
+        // worker's cleanup pass sweeps + clears entries from this list
+        // once the underlying object is actually deleted.
+        staleStorageKeys: jsonb("stale_storage_keys")
+            .$type<string[]>()
+            .notNull()
+            .default(sql`'[]'::jsonb`),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        startedAt: timestamp("started_at"),
+        completedAt: timestamp("completed_at"),
+        expiresAt: timestamp("expires_at"),
+    },
+    (table) => ({
+        userIdIdx: index("export_jobs_user_id_idx").on(table.userId),
+        // Claim query scans pending rows oldest-first.
+        statusCreatedAtIdx: index("export_jobs_status_created_at_idx").on(
+            table.status,
+            table.createdAt,
+        ),
+        // Cleanup pass scans completed rows past expiry.
+        expiresAtIdx: index("export_jobs_expires_at_idx").on(table.expiresAt),
+        // Enforces "one active job per user" at the database layer --
+        // the application-level check-then-insert in POST /api/backup is
+        // only a fast path; this index is what actually prevents two
+        // concurrent requests from both slipping past that check and
+        // enqueuing duplicate jobs.
+        userActiveUnique: uniqueIndex("export_jobs_user_active_unique")
+            .on(table.userId)
+            .where(sql`${table.status} in ('pending', 'processing')`),
+    }),
+);
+
+/**
+ * Storage objects whose delete failed and must be retried, e.g. a deleted
+ * account's audio or export archives. Not user-scoped: rows outlive the
+ * user they belonged to. Only keys that can never be written again may be
+ * queued (user-namespaced keys of deleted users, per-claim export keys),
+ * so a retried delete can never remove live data. Retried by the export
+ * worker with backoff until `attempts` runs out, then kept as `failed`
+ * for an operator.
+ */
+export const storageDeletionQueue = pgTable(
+    "storage_deletion_queue",
+    {
+        storageKey: text("storage_key").primaryKey(),
+        source: varchar("source", { length: 40 }).notNull(),
+        status: varchar("status", { length: 16 }).notNull().default("pending"),
+        attempts: integer("attempts").notNull().default(0),
+        nextAttemptAt: timestamp("next_attempt_at").notNull().defaultNow(),
+        claimToken: text("claim_token"),
+        lastError: text("last_error"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        dueIdx: index("storage_deletion_queue_due_idx").on(
+            table.status,
+            table.nextAttemptAt,
+        ),
+    }),
+);
+
 export const apiRateLimitBuckets = pgTable(
     "api_rate_limit_buckets",
     {
@@ -573,3 +800,315 @@ export const apiRateLimitBuckets = pgTable(
         ),
     }),
 );
+
+/**
+ * Aggregate hit counter for the install.sh routes. Counts every fetch of
+ * `/install.sh` and `/{version}/install.sh` on the hosted instance.
+ *
+ * Privacy: no IP, no User-Agent, no identifier of any kind. Just (day,
+ * version) -> count. This is first-party traffic on our own webserver,
+ * not user-device storage. Self-host instances do NOT write to this
+ * table -- writes are gated on env.IS_HOSTED.
+ *
+ * Not an instance count. One operator re-running `install.sh` five times
+ * is five hits. CI pipelines count every run. Read as a directional
+ * trend, not absolute deployments.
+ */
+export const installScriptHits = pgTable(
+    "install_script_hits",
+    {
+        day: date("day").notNull(),
+        /** "latest" for the unversioned route, "vX.Y.Z" for versioned, "invalid" for anything that fails the version regex. */
+        version: text("version").notNull(),
+        count: integer("count").notNull().default(0),
+    },
+    (table) => ({
+        pk: primaryKey({ columns: [table.day, table.version] }),
+    }),
+);
+
+export const emailSuppressions = pgTable(
+    "email_suppressions",
+    {
+        email: text("email").primaryKey(),
+        reason: varchar("reason", { length: 20 }).notNull(),
+        note: text("note"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        createdAtIdx: index("email_suppressions_created_at_idx").on(
+            table.createdAt,
+        ),
+    }),
+);
+
+export const emailCampaigns = pgTable("email_campaigns", {
+    id: text("id")
+        .primaryKey()
+        .$defaultFn(() => nanoid()),
+    slug: text("slug").notNull().unique(),
+    subject: text("subject").notNull(),
+    kind: varchar("kind", { length: 20 }).notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export const emailDeliveries = pgTable(
+    "email_deliveries",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        campaignId: text("campaign_id")
+            .notNull()
+            .references(() => emailCampaigns.id, { onDelete: "cascade" }),
+        userId: text("user_id").references(() => users.id, {
+            onDelete: "set null",
+        }),
+        subscriberId: text("subscriber_id").references(
+            () => newsletterSubscriptions.id,
+            { onDelete: "set null" },
+        ),
+        email: text("email").notNull(),
+        status: varchar("status", { length: 30 }).notNull(),
+        messageId: text("message_id"),
+        error: text("error"),
+        sentAt: timestamp("sent_at"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        campaignEmailUnique: unique(
+            "email_deliveries_campaign_email_unique",
+        ).on(table.campaignId, table.email),
+        campaignStatusIdx: index("email_deliveries_campaign_status_idx").on(
+            table.campaignId,
+            table.status,
+        ),
+        userIdIdx: index("email_deliveries_user_id_idx").on(table.userId),
+    }),
+);
+
+export const emailValidations = pgTable(
+    "email_validations",
+    {
+        email: text("email").primaryKey(),
+        reachable: varchar("reachable", { length: 20 }).notNull(),
+        isDisposable: boolean("is_disposable").notNull().default(false),
+        isRoleAccount: boolean("is_role_account").notNull().default(false),
+        hasFullInbox: boolean("has_full_inbox").notNull().default(false),
+        isCatchAll: boolean("is_catch_all").notNull().default(false),
+        mxAccepts: boolean("mx_accepts").notNull().default(false),
+        rawResponse: jsonb("raw_response"),
+        provider: varchar("provider", { length: 30 })
+            .notNull()
+            .default("reacher-stacked"),
+        checkedAt: timestamp("checked_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        checkedAtIdx: index("email_validations_checked_at_idx").on(
+            table.checkedAt,
+        ),
+    }),
+);
+
+export const newsletterSubscriptions = pgTable(
+    "newsletter_subscriptions",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        email: text("email").notNull().unique(),
+        source: varchar("source", { length: 20 }).notNull(), // 'landing' | 'install' | 'admin'
+        consentedAt: timestamp("consented_at").notNull().defaultNow(),
+        confirmedAt: timestamp("confirmed_at"),
+        unsubscribedAt: timestamp("unsubscribed_at"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        confirmedAtIdx: index("newsletter_subscriptions_confirmed_at_idx").on(
+            table.confirmedAt,
+        ),
+    }),
+);
+
+export const billingCustomers = pgTable("billing_customers", {
+    userId: text("user_id")
+        .primaryKey()
+        .references(() => users.id, { onDelete: "cascade" }),
+    stripeCustomerId: text("stripe_customer_id").notNull().unique(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const foundingMemberReservations = pgTable(
+    "founding_member_reservations",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        userId: text("user_id").references(() => users.id, {
+            onDelete: "set null",
+        }),
+        stripeCheckoutSessionId: text("stripe_checkout_session_id").unique(),
+        stripePriceId: text("stripe_price_id").notNull(),
+        status: foundingMemberReservationStatusEnum("status")
+            .notNull()
+            .default("reserved"),
+        reservedAt: timestamp("reserved_at").notNull().defaultNow(),
+        expiresAt: timestamp("expires_at").notNull(),
+        consumedAt: timestamp("consumed_at"),
+        releasedAt: timestamp("released_at"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        statusExpiresAtIdx: index(
+            "founding_member_reservations_status_expires_at_idx",
+        ).on(table.status, table.expiresAt),
+        userStatusIdx: index("founding_member_reservations_user_status_idx").on(
+            table.userId,
+            table.status,
+        ),
+        userReservedUnique: uniqueIndex(
+            "founding_member_reservations_user_reserved_unique",
+        )
+            .on(table.userId)
+            .where(sql`${table.status} = 'reserved'`),
+    }),
+);
+
+export const subscriptions = pgTable(
+    "subscriptions",
+    {
+        id: text("id").primaryKey(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => users.id, { onDelete: "cascade" }),
+        stripeCustomerId: text("stripe_customer_id").notNull(),
+        stripePriceId: text("stripe_price_id"),
+        status: varchar("status", { length: 24 }).notNull(),
+        amountValue: text("amount_value").notNull(),
+        amountCurrency: varchar("amount_currency", { length: 3 }).notNull(),
+        interval: text("interval").notNull(),
+        description: text("description"),
+        /** ISO-3166-1 alpha-2 billing country, for our own VAT-OSS records. */
+        billingCountry: varchar("billing_country", { length: 2 }),
+        startDate: timestamp("start_date"),
+        nextPaymentAt: timestamp("next_payment_at"),
+        canceledAt: timestamp("canceled_at"),
+        withdrawalWaiverAcceptedAt: timestamp("withdrawal_waiver_accepted_at"),
+        metadata: jsonb("metadata"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        userIdActiveUnique: uniqueIndex("subscriptions_user_id_active_unique")
+            .on(table.userId)
+            .where(sql`${table.status} IN ('active', 'trialing', 'past_due')`),
+        userStatusIdx: index("subscriptions_user_status_idx").on(
+            table.userId,
+            table.status,
+        ),
+    }),
+);
+
+export const stripeWebhookEvents = pgTable(
+    "stripe_webhook_events",
+    {
+        eventId: text("event_id").primaryKey(),
+        type: varchar("type", { length: 60 }).notNull(),
+        eventCreatedAt: timestamp("event_created_at").notNull(),
+        payload: jsonb("payload")
+            .$type<Record<string, unknown>>()
+            .notNull()
+            .default({}),
+        // Existing claim-only rows predate the durable inbox and must remain
+        // completed on migration; new inbox inserts explicitly set pending.
+        status: stripeWebhookEventStatusEnum("status")
+            .notNull()
+            .default("completed"),
+        attempts: integer("attempts").notNull().default(0),
+        claimToken: text("claim_token"),
+        startedAt: timestamp("started_at"),
+        nextAttemptAt: timestamp("next_attempt_at").notNull().defaultNow(),
+        lastError: text("last_error"),
+        completedAt: timestamp("completed_at"),
+        failedAt: timestamp("failed_at"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        dueScanIdx: index("stripe_webhook_events_due_idx").on(
+            table.status,
+            table.nextAttemptAt,
+        ),
+        createdAtIdx: index("stripe_webhook_events_created_at_idx").on(
+            table.createdAt,
+        ),
+    }),
+);
+
+export const emailLog = pgTable(
+    "email_log",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        userId: text("user_id")
+            .notNull()
+            .references(() => users.id, { onDelete: "cascade" }),
+        // Wide enough for namespaced per-object keys such as
+        // `payment_failed:<invoiceId>` (prefix + `in_...` id ~= 42 chars).
+        kind: varchar("kind", { length: 120 }).notNull(),
+        sentAt: timestamp("sent_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        userKindUnique: unique("email_log_user_kind_unique").on(
+            table.userId,
+            table.kind,
+        ),
+    }),
+);
+
+/**
+ * Status page traffic counters, one row per (part, minute). Every process
+ * aggregates outcomes in memory and adds them here once a minute, so the
+ * counts and the latency histogram sum across processes. The verdict
+ * columns hold the worst raw verdict reason per state for the sustain rule.
+ * Rows older than about a day are pruned. Written only when STATUS_TOKEN is set.
+ */
+export const statusMinuteBuckets = pgTable(
+    "status_minute_buckets",
+    {
+        part: varchar("part", { length: 40 }).notNull(),
+        minute: timestamp("minute").notNull(),
+        ok: integer("ok").notNull().default(0),
+        err: integer("err").notNull().default(0),
+        latencyBuckets: integer("latency_buckets")
+            .array()
+            .notNull()
+            .default(sql`'{}'::integer[]`),
+        verdictOk: text("verdict_ok"),
+        verdictSlow: text("verdict_slow"),
+        verdictDown: text("verdict_down"),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        pk: primaryKey({ columns: [table.part, table.minute] }),
+        minuteIdx: index("status_minute_buckets_minute_idx").on(table.minute),
+    }),
+);
+
+/**
+ * Last success / failure of each background job, for the status page's
+ * freshness checks. One row per job name. Written only when STATUS_TOKEN
+ * is set.
+ */
+export const statusJobRuns = pgTable("status_job_runs", {
+    job: varchar("job", { length: 40 }).primaryKey(),
+    lastSuccessAt: timestamp("last_success_at"),
+    lastErrorAt: timestamp("last_error_at"),
+    failingSince: timestamp("failing_since"),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});

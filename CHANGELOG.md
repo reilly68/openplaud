@@ -1,13 +1,137 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-11-21
+
+### Added
+- Custom summary prompts are now reachable from Settings → Summary: create, edit, view, and delete custom prompts, and select one as the default alongside the built-in presets. The per-recording summary dropdown also lists custom prompts and now initializes to the saved default instead of always defaulting to "General Summary" ([#199](https://github.com/riffado/riffado/issues/199)).
+- Download the original audio file from the recording player and the recording row menu (`GET /api/recordings/[id]/audio?download=1`) ([#229](https://github.com/riffado/riffado/issues/229)).
+- Inline rename for recording titles. Click the title in the player (or the recording page heading), edit, and press Enter. Persists via `PATCH /api/recordings/[id]` ([#217](https://github.com/riffado/riffado/issues/217)).
+- Auto-summary after transcription: an opt-in per-user setting that generates a summary with the chosen prompt once a transcript lands. Capped per user by the optional `AUTO_SUMMARY_RATE_LIMIT_PER_HOUR` (default 60); a capped run fires a `summary.failed` webhook. Adds migration `0037` (`user_settings.auto_summarize`, `auto_summarize_preset`) ([#167](https://github.com/riffado/riffado/issues/167)).
+- ElevenLabs Scribe as a transcription provider, with speaker separation settings. Adds migration `0038` (`user_settings.speaker_diarization`, `diarization_speaker_count`) ([#304](https://github.com/riffado/riffado/pull/304), based on [#297](https://github.com/riffado/riffado/pull/297) by [@L480](https://github.com/L480)).
+- China mainland Plaud accounts (`api.plaud.cn`) ([#303](https://github.com/riffado/riffado/pull/303), based on [#273](https://github.com/riffado/riffado/pull/273) by [@x-kerry](https://github.com/x-kerry)).
+- Imported Plaud summaries render as Markdown, and transcripts are grouped by speaker ([#302](https://github.com/riffado/riffado/pull/302), based on [#265](https://github.com/riffado/riffado/pull/265) by [@4dmrkey](https://github.com/4dmrkey)).
+- `WHISPER_COMPRESS=off` skips the 25 MiB re-encode for self-hosted Whisper-compatible servers. Only safe when every transcription provider is self-hosted ([#324](https://github.com/riffado/riffado/pull/324) by [@ddunford](https://github.com/ddunford)).
+- Optional per-feature status checks at `GET /api/status/<part>` (sign-in, Plaud, sync, storage, emails, transcription, webhooks, auto-transcribe, payments) for an external status monitor such as Kener. Adds the `status_minute_buckets` and `status_job_runs` tables (migration `0039`) and the optional `STATUS_TOKEN`, passed through `docker-compose.yml`. Inert unless `STATUS_TOKEN` is set ([#343](https://github.com/riffado/riffado/pull/343)).
+- Settings shows when the Plaud connection ends, and the dashboard warns three days before ([#346](https://github.com/riffado/riffado/pull/346)).
+- Failed storage deletes (account deletion, export attempts, upload clean-up) are retried by the export worker from a new `storage_deletion_queue` table (migration `0041`) ([#347](https://github.com/riffado/riffado/pull/347)).
+
+### Fixed
+- Changing the default summary prompt in Settings → Summary wiped any custom summary prompts on every save, since the request always sent `customPrompts: []` instead of the current list ([#199](https://github.com/riffado/riffado/issues/199)).
+- A failed save or delete of a custom summary prompt now rolls back, and the settings fetch no longer overwrites a prompt you just picked ([#272](https://github.com/riffado/riffado/pull/272)).
+- 0.6.x Docker images crashed on startup on some hosts (`EISDIR` in the instrumentation hook, from a Bun regression). The image now pins `oven/bun:1.4.0` ([#290](https://github.com/riffado/riffado/issues/290), [#284](https://github.com/riffado/riffado/pull/284)).
+- Long recordings no longer fail at the OpenAI SDK's 10-minute default. `WHISPER_REQUEST_TIMEOUT_MS` (default 60 min) also covers chat-style providers such as OpenRouter ([#219](https://github.com/riffado/riffado/issues/219)).
+- Long transcriptions were still cut off at Bun's 300-second fetch default. The request deadline now applies on Bun and Node for OpenAI-compatible, Gemini, ElevenLabs and Mynah calls ([#311](https://github.com/riffado/riffado/pull/311) by [@SergMedin](https://github.com/SergMedin), reported in [#325](https://github.com/riffado/riffado/pull/325) by [@ddunford](https://github.com/ddunford)).
+- Plaud recordings served as `.mp3` that are really Ogg/Opus are detected and transcoded, so OpenRouter and other providers accept them ([#160](https://github.com/riffado/riffado/issues/160)).
+- Self-host: storage now persists across container recreation, SMTP settings reach the container, and auto-transcribe retries instead of skipping a recording for good ([#241](https://github.com/riffado/riffado/issues/241)).
+- Auto-transcribe stops retrying a recording after a permanent provider failure (for example 413 or 422) and backs off on temporary ones, at most six attempts ([#305](https://github.com/riffado/riffado/issues/305), [#306](https://github.com/riffado/riffado/pull/306) by [@vicmike](https://github.com/vicmike)).
+- Two Retry clicks on the same recording now share one transcription instead of running twice ([#285](https://github.com/riffado/riffado/pull/285)).
+- Sync reaches older recordings, so their Plaud-native transcripts and summaries get imported ([#274](https://github.com/riffado/riffado/issues/274)).
+- Switching recordings while a summary is generating no longer shows it on the wrong recording ([#283](https://github.com/riffado/riffado/issues/283)).
+- OpenAI diarized transcription normalizes audio to mono 16 kHz, splits long recordings, and shows timestamps per speaker turn ([#291](https://github.com/riffado/riffado/issues/291), [#301](https://github.com/riffado/riffado/pull/301), based on [#292](https://github.com/riffado/riffado/pull/292) by [@surekap](https://github.com/surekap)).
+- The Docker healthcheck could never fail, so a dead container reported healthy, and the standalone server never listened on `127.0.0.1`. The image now binds `0.0.0.0` and the compose healthcheck probes loopback with a timeout ([#307](https://github.com/riffado/riffado/issues/307), [#329](https://github.com/riffado/riffado/pull/329) by [@Pierre-Saigot](https://github.com/Pierre-Saigot), [#309](https://github.com/riffado/riffado/pull/309) by [@rubicon](https://github.com/rubicon)).
+- `curl -fsSL https://riffado.com/install.sh | sh` could hang forever after the prompts ([#294](https://github.com/riffado/riffado/issues/294)).
+- The installer now publishes the port named in `APP_URL` (localhost or an IP with an explicit port) and health-checks `http://127.0.0.1:<port>`; previously any port other than 3000 failed the health check ([#295](https://github.com/riffado/riffado/issues/295)).
+- Version-pinned installs (`riffado.com/vX.Y.Z/install.sh`) installed the latest release instead of the pinned one ([#344](https://github.com/riffado/riffado/pull/344)).
+- Sync imported nothing for Plaud accounts migrated to Plaud 4.0: Plaud answers the legacy file endpoints with status `-1800907`, and sync reported success while importing nothing. Riffado now detects the migration and switches to Plaud's 4.0 file API, matching existing recordings so nothing is re-imported, downloading the transcoded audio when available, and keeping title sync working ([#327](https://github.com/riffado/riffado/issues/327), [#337](https://github.com/riffado/riffado/issues/337), [#328](https://github.com/riffado/riffado/pull/328) by [@Pierre-Saigot](https://github.com/Pierre-Saigot), with fixes from [@nadelacruz-00](https://github.com/nadelacruz-00)).
+- Plaud now issues 24-hour web sign-ins and 30-day email-code sign-ins with refresh tokens; Riffado assumed ~300-day tokens, so Riffado Connector connections died after a day. Riffado now stores Plaud's refresh token (encrypted) and renews the access token until the 30-day sign-in ends. Connections made with Riffado Connector 0.2.4 or newer last up to 30 days. Adds migration `0040` (`plaud_connections.refresh_token`, `access_expires_at`, `session_expires_at`) ([#346](https://github.com/riffado/riffado/pull/346)).
+- Export archives: only the newest complete archive is kept per user, archives are deleted with the account, and a failed export build is requeued instead of staying stuck in `processing` ([#347](https://github.com/riffado/riffado/pull/347)).
+- In-app playback no longer downloads the whole recording for every seek: S3 storage serves a 15-minute presigned URL, and other requests stream with proper `Range` support. If the browser can't reach the storage endpoint (for example MinIO on the Docker network), playback falls back to streaming through Riffado ([#347](https://github.com/riffado/riffado/pull/347)).
+
+### Changed
+- Migration `0036_wide_raider` upgrades `stripe_webhook_events` to a durable Stripe event inbox. Inert on self-host unless hosted billing is configured.
+- Removes optional `RYBBIT_SITE_ID` / `RYBBIT_HOST` and the `/api/int/*` analytics proxy. Adds optional `.env.example` vars `OA_TRACKING_KEY` / `OA_HOST` for hosted-only cookieless Open Analytics. Inert unless `IS_HOSTED=true`.
+- `docker-compose.yml` changes: a `storage` named volume mounted at `/app/storage`, `SMTP_*` and `STATUS_TOKEN` passed through to the app, and the published port is now `${APP_PORT:-3000}:3000`. Existing installs without `APP_PORT` stay on 3000. Copy the new file over yours when upgrading.
+- Upgrading runs migrations `0037` to `0041`, all additive.
+- OpenAI-compatible and Gemini transcription no longer use the SDK's automatic retries, so a finished upload is never sent twice. HTTP 429, refused connections and unknown hosts are retried up to twice (honouring `Retry-After`, capped at 30s); dropped connections only within 5 seconds of starting. 5xx responses and timeouts are not retried.
+- `NON_INTERACTIVE` is now honoured by the installer: `1`/`true` takes every default, `0`/`false` requires a terminal.
+- Paste-token instructions point at the `pld_ut` cookie; tokens from the current Plaud web app last about a day ([#346](https://github.com/riffado/riffado/pull/346)).
+
+### Security
+- Official `docker-compose.yml` publishes Postgres on `127.0.0.1:5432` only.
+- `scripts/install.sh` now generates `POSTGRES_PASSWORD` (`openssl rand -hex 24`) and writes it to `.env` with the other secrets. The compose default remains `postgres` so existing volumes still start.
+- Startup warning when `DATABASE_URL` uses the known default password `postgres`.
+- Existing stacks can rotate in place: `ALTER USER postgres WITH PASSWORD '…'`, write the same value to `.env` as `POSTGRES_PASSWORD`, then recreate the app. Recreating the `db` volume is not required.
+
+## [0.6.4] - 2026-07-24
+
+### Fixed
+- `PlaudClient.listDevices()` now validates the Plaud API response shape (`status === 0` and `data_devices` an array) before returning it, instead of trusting a malformed `200` response. A workspace-token mint failure followed by a business-error device-list response crashed the whole Plaud connect flow with an unhandled `TypeError` on `undefined.data_devices`, surfacing as a generic "unexpected error" instead of an actionable message ([#231](https://github.com/riffado/riffado/issues/231)).
+- The companion [riffado/connector](https://github.com/riffado/connector) browser extension had several bugs preventing most "Continue with Plaud" attempts from completing: the plaud.ai tab could close before login finished (v0.2.1), a coincidental non-token localStorage value could be captured as if it were the access token (v0.2.2), and — the actual root cause underneath both — the entire `localStorage`-scanning capture strategy could never reliably find a real token, because Plaud authenticates with an `HttpOnly` session cookie no page JavaScript can read. v0.2.3 replaces it with `chrome.cookies`-based capture, the correct API for reading an `HttpOnly` cookie. See the [connector changelog](https://github.com/riffado/connector/blob/main/CHANGELOG.md) for the full trail.
+
+## [0.6.3] - 2026-07-22
+
+### Added
+- Optional `.env.example` vars `POSTHOG_KEY`/`POSTHOG_HOST` for hosted-only product analytics. Inert unless `IS_HOSTED=true` and `POSTHOG_KEY` is set.
+- Server-side background sync now runs for every self-hosted deployment, not just hosted Pro accounts. A worker started on process boot polls Plaud and processes new recordings on its own schedule (default every 5 minutes), including auto-transcription and notifications, independent of any open browser tab, so an unattended `docker compose up` container keeps syncing. Adds optional `.env.example` vars `BACKGROUND_SYNC_ENABLED` (default true; set false to opt out entirely) and `BACKGROUND_SYNC_INTERVAL_MS` ([#159](https://github.com/riffado/riffado/issues/159)).
+
+## [0.6.2] - 2026-07-21
+
+### Fixed
+- New signups landed on `/dashboard` with onboarding effectively skipped: `userSettings.onboardingCompleted` was only ever set when manually retriggered from Settings, never on first run. The onboarding dialog now auto-opens on first paint when onboarding is incomplete and is non-dismissible until it's done ([#243](https://github.com/riffado/riffado/pull/243)).
+- Signup with email verification enforced (hosted + SMTP configured) redirected straight to `/onboarding`, which bounced the unauthenticated user to `/login` since no session exists until the verification link is clicked. Signup now shows an in-place "check your email" panel with a rate-limited resend action ([#244](https://github.com/riffado/riffado/pull/244)).
+
+## [0.6.1] - 2026-07-20
+
+### Fixed
+- The standalone Docker image built by v0.6.0 crashed on startup for every deployment, self-host and hosted alike (`TypeError: ... is not a function` from `src/instrumentation.ts`). Next.js's output tracer externalized `@react-email/render`'s `prettier` dependency into a build directory this project's `Dockerfile` didn't copy into the image, breaking every worker that sends email. Replaced `@react-email/render` with a small helper built directly on `react-dom/server`, removing the dependency from the runtime image entirely. v0.6.0's GitHub Release was never published; this is the first public release of that cycle.
+
+## [0.6.0] - 2026-07-20
+
+### Breaking Changes
+- Upgrading runs migrations `0024` through `0034`. Back up PostgreSQL first. Migration `0024_sour_serpent_society.sql` drops the unused `storage_config` table with `CASCADE`; dump any historical rows before upgrading if they still matter ([#83](https://github.com/riffado/riffado/issues/83)). The remaining billing, export, email, and metering migrations are additive. No new environment variable is required for a normal self-hosted installation.
+
+### Added
+- Full-data backup archives from Settings → Export & Backup. Each archive contains every recording's audio, transcript, and AI summary plus a manifest, providing a complete path between hosted and self-hosted installations. Archive creation runs asynchronously and streams between storage and the zip without buffering an entire library in memory. Jobs have bounded concurrency, retries, stale-job recovery, a 24-hour cooldown, and seven-day retention. Adds the `export_jobs` table and streaming methods to local and S3 storage providers.
+- Google Gemini as a native transcription provider. Gemini audio uses `generateContent` because its OpenAI compatibility layer does not implement `/audio/transcriptions`. Inline audio is limited to 20 MB and larger files return a clear error ([#176](https://github.com/riffado/riffado/pull/176) by [@amateo8282](https://github.com/amateo8282)).
+- Server persistence for browser-generated Whisper transcripts through `POST /api/recordings/[id]/transcription/from-browser`, with a workstation action for local browser transcription.
+- Automatic compression for oversized OpenAI-style transcription requests. Audio above the configured request limit is re-encoded to mono Opus with adaptive bitrate retries, and transcription requests use a configurable long-running timeout. Adds `WHISPER_MAX_BYTES`, `WHISPER_COMPRESS_BITRATE_KBPS`, and `WHISPER_REQUEST_TIMEOUT_MS` ([#183](https://github.com/riffado/riffado/pull/183) by [@dYn36](https://github.com/dYn36)).
+- Eighteen additional transcription-language choices covering Central and Eastern Europe, the Nordics, the Middle East, South Asia, and Southeast Asia ([#170](https://github.com/riffado/riffado/pull/170) by [@berezovskiya](https://github.com/berezovskiya)).
+- Email campaign and newsletter primitives available to self-hosters: resumable per-recipient delivery, suppression handling, consent gating, optional Reacher validation, RFC 8058 unsubscribe, and double-opt-in newsletter endpoints. Adds `email_campaigns`, `email_deliveries`, `email_suppressions`, `email_validations`, and `newsletter_subscriptions` plus optional SMTP, rate, and Reacher settings.
+- A shared capability interface at `src/lib/entitlements.ts`. Self-host remains fully permissive; hosted deployments derive capabilities from `users.plan` and the transition window.
+- Optional `ADMIN_HOSTNAME` isolation through `src/proxy.ts`, allowing hosted operators to restrict admin and Stripe routes to a dedicated hostname without a second deployment. Unset preserves the existing single-host behavior.
+- Hosted billing and managed-transcription deploy surface. Migrations add billing, reservation, subscription, email-log, and metering state; `.env.example` documents optional `BILLING_*`, `STRIPE_*`, `MYNAH_*`, `GEO_COUNTRY_HEADER`, and related email settings. These features remain inert on self-host unless explicitly configured, and hosted routes continue to return 404 outside hosted mode ([#220](https://github.com/riffado/riffado/pull/220)).
+- Adds the `founding_member_reservations` table (migrations `0033`/`0034`) and optional `.env.example` vars `STRIPE_STANDARD_PRICE_ID_USD`/`_EUR`, `STRIPE_PRICE_ID_USD_ANNUAL`/`_EUR_ANNUAL`, `BILLING_PRICE_USD_ANNUAL`/`_EUR_ANNUAL`, and `STRIPE_LEGACY_PRO_PRICE_IDS`. Inert on self-host unless `BILLING_ENABLED` is set ([#232](https://github.com/riffado/riffado/pull/232)).
+
+### Changed
+- Independent database reads on dashboard, recording detail, storage settings, and admin list paths now execute in parallel, reducing server-side request waterfalls ([#192](https://github.com/riffado/riffado/pull/192) by [@brendanerofeev](https://github.com/brendanerofeev)).
+- The shared confirmation-dialog context now keeps a stable callback reference, avoiding unnecessary consumer rerenders ([#198](https://github.com/riffado/riffado/pull/198) by [@brendanerofeev](https://github.com/brendanerofeev)).
+
+### Fixed
+- Long-meeting summaries no longer discard everything after the first 8,000 transcript characters. The full transcript is sent, and models with insufficient context return a clear client error instead of a generic server failure ([#213](https://github.com/riffado/riffado/issues/213)).
+- Browser transcription now decodes and resamples audio to mono 16 kHz PCM before running Whisper, and production builds include the required Transformers.js worker stubs ([#224](https://github.com/riffado/riffado/pull/224)).
+- Plaud authentication now rejects short-lived workspace tokens during manual connection, surfaces invalid-token reconnect state reliably, and provides a non-destructive reconnect path that preserves the existing connection and recordings ([#227](https://github.com/riffado/riffado/pull/227)).
+- Email/password authentication endpoints now use the shared database-backed rate limiter instead of per-process memory. Sign-in, sign-up, reset, and forgot-password routes receive scoped limits; deployments without trusted client-IP headers fail open for the IP bucket and log a startup warning rather than sharing one global `unknown` bucket ([#215](https://github.com/riffado/riffado/pull/215)).
+- Webhook settings keep row actions visible when endpoint URLs are long ([#214](https://github.com/riffado/riffado/pull/214)).
+- GPT-5 and o-series requests use `max_completion_tokens` instead of the unsupported legacy token parameter ([#162](https://github.com/riffado/riffado/pull/162) by [@dYn36](https://github.com/dYn36)).
+- Hosted webhook and worker instrumentation now lives under `src/`, ensuring it runs in standalone production images ([#191](https://github.com/riffado/riffado/pull/191) by [@brendanerofeev](https://github.com/brendanerofeev)).
+- `docker-compose.yml` now passes `LOCAL_STORAGE_PATH` into the application container, so custom local-storage paths work in published deployments ([#174](https://github.com/riffado/riffado/pull/174) by [@berezovskiya](https://github.com/berezovskiya)).
+
+### Security
+- Better Auth session cookies are regression-tested as host-only, preventing a future admin-host configuration from widening customer session cookies to `.riffado.com`.
+
+## [0.5.6] - 2026-05-30
+
+## [0.5.5] - 2026-05-30
+
+### Fixed
+- Rate-limit bucket upsert crashed every `/api/v1/*` and `/api/plaud/sync` request with `postgres-js` `ERR_INVALID_ARG_TYPE` ("Received an instance of Date") under Bun / Next 16. Drizzle only runs column encoders for `.values({...})` and bare column-mapped values; `Date` values interpolated into raw `` sql`case when reset_at <= ${now}` `` templates reached the driver as raw JS objects. Cast all Date params in the bucket upsert to `${iso}::timestamp`, matching the (TZ-naive) column type. Same hardening applied to six implicit text→timestamp comparisons in admin analytics queries that could also defeat index usage on `created_at` / `last_sync` ([#193](https://github.com/riffado/riffado/pull/193)).
+- Admin user search no longer treats `%` and `_` in the query as `ILIKE` wildcards. Escape with `` escape '\' `` so a search for `_admin` matches literal `_admin`, not anything ending in `admin`. Admin-only surface, low severity ([#193](https://github.com/riffado/riffado/pull/193)).
+
+### Changed
+- Rate limiter now **fails open** when the bucket store is unreachable. The previous behavior returned a 500 to every authenticated request when the DB upsert errored, taking the entire v1 API and Plaud sync down with the rate limiter. The new behavior catches the error, logs `[rate-limit] bucket store unavailable; failing open` for Sentry visibility, and lets the request through with a synthetic full bucket. A broken safety net should not collapse the building; upstream (Cloudflare / ALB) still rate-limits at the edge and `/api/v1/*` has per-token auth as a second gate. Trade-off: under a sustained outage an attacker could briefly burst past nominal limits ([#193](https://github.com/riffado/riffado/pull/193)).
+
+## [0.5.4] - 2026-05-29
 
 ### Added
 - `PLAUD_PROXY_SCOPE` env var (`all` default | `api-only`) controlling whether `resource.plaud.ai` signed-URL audio downloads go through the Webshare residential proxy. Audio bytes dominate proxy bandwidth; operators who verify `resource.plaud.ai` serves direct from their egress IPs (via `scripts/plaud-egress-probe.sh`) can flip to `api-only` and save most of the Webshare quota without affecting API correctness. Default `all` preserves existing behavior.
 - `PLAUD_SYNC_RATE_LIMIT_PER_MINUTE` env var (default 10) capping per-user sync requests. Backstops the new client-side throttling at the route boundary so a script hammering `POST /api/plaud/sync` is rejected before any Plaud or Webshare call is issued.
 
 ### Changed
-- Sync flow now coalesces concurrent calls for the same user inside one Next.js worker into a single Plaud round-trip; secondary callers receive the same result with an `inProgress: true` marker and the client renders it as a quiet no-op (no extra `router.refresh()`, no duplicate toast). Combined with a new client-side cross-tab `localStorage` in-flight stamp (90s TTL) and a 5s floor on manual sync taps, this collapses N-tab fan-out and rage-clicks before they reach the API. Reduces Webshare proxy load on hosted by suppressing redundant runs that were previously paginating Plaud and re-downloading recordings through the proxy.
+- `WEBSHARE_API_KEY` proxy path now uses native `fetch` through `undici.ProxyAgent` instead of the previous `wreq-js` dependency. Drops a Rust napi addon from the standalone Docker image and removes the Turbopack workaround in `next.config.ts`. No behavioral change for proxy users; direct-egress path unchanged.
+- Sync flow now coalesces concurrent calls for the same user inside one Next.js worker into a single Plaud round-trip; secondary callers receive the same result with an `inProgress: true` marker and the client renders it as a quiet no-op (no extra `router.refresh()`, no duplicate toast). Combined with a new client-side cross-tab `localStorage` in-flight stamp (90s TTL) and a 5s floor on manual sync taps, this collapses N-tab fan-out and rage-clicks before they reach the API.
+
+### Removed
+- `wreq-js` dependency.
 
 ## [0.5.3] - 2026-05-15
 
@@ -17,50 +141,50 @@
 ## [0.5.2] - 2026-05-15
 
 ### Fixed
-- Plaud sync from hosted/VPS deploys whose ASN is flagged by Cloudflare: pair the Webshare residential proxy from v0.5.1 with a Chrome TLS/JA3 fingerprint via `wreq-js`, so Bun's default handshake stops getting a 403 + Cloudflare challenge even from a clean residential IP. Required because Cloudflare scores ASN and TLS fingerprint independently; #148 only addressed the ASN side. Direct path (no `WEBSHARE_API_KEY` set) is unchanged and does not load the new dependency at runtime ([#152](https://github.com/openplaud/openplaud/pull/152)).
+- Plaud sync from hosted/VPS deploys whose ASN is flagged by Cloudflare: pair the Webshare residential proxy from v0.5.1 with a Chrome TLS/JA3 fingerprint via `wreq-js`, so Bun's default handshake stops getting a 403 + Cloudflare challenge even from a clean residential IP. Required because Cloudflare scores ASN and TLS fingerprint independently; #148 only addressed the ASN side. Direct path (no `WEBSHARE_API_KEY` set) is unchanged and does not load the new dependency at runtime ([#152](https://github.com/riffado/riffado/pull/152)).
 
 ## [0.5.1] - 2026-05-15
 
 ### Added
-- Optional outbound proxy for Plaud API calls via Webshare residential proxies. When `WEBSHARE_API_KEY` is set, every request to `api*.plaud.ai` / `resource.plaud.ai` routes through a random valid proxy from the Webshare list, with automatic rotation on Cloudflare 403/407 responses. Unset (default) keeps the direct egress path. Required for hosted deployments on flagged datacenter ASNs where Cloudflare returns a 403 HTML challenge before requests reach Plaud's origin; not needed for residential / homelab self-hosts. No effect on non-Plaud outbound traffic. `scripts/plaud-egress-probe.sh` can validate proxy behavior end-to-end against a real account ([#148](https://github.com/openplaud/openplaud/pull/148)).
+- Optional outbound proxy for Plaud API calls via Webshare residential proxies. When `WEBSHARE_API_KEY` is set, every request to `api*.plaud.ai` / `resource.plaud.ai` routes through a random valid proxy from the Webshare list, with automatic rotation on Cloudflare 403/407 responses. Unset (default) keeps the direct egress path. Required for hosted deployments on flagged datacenter ASNs where Cloudflare returns a 403 HTML challenge before requests reach Plaud's origin; not needed for residential / homelab self-hosts. No effect on non-Plaud outbound traffic. `scripts/plaud-egress-probe.sh` can validate proxy behavior end-to-end against a real account ([#148](https://github.com/riffado/riffado/pull/148)).
 
 ## [0.5.0] - 2026-05-15
 
 ### Added
-- Automation API: versioned `/api/v1/recordings` namespace for external agents (list with cursor pagination + `created_since` / `updated_since` / `has_transcription` filters, get, transcript, metadata, audio redirect). Personal API keys (`op_...` prefix, HMAC-SHA256 hashed at rest keyed by `API_TOKEN_HASH_SECRET ?? BETTER_AUTH_SECRET`, revocable, with `source` / `name` / `lastUsedAt` metadata) managed from Settings. Per-IP and per-identity rate limits on `/api/v1/*` (1200/min IP, 600/min identity) with `Retry-After` and `X-RateLimit-*` headers. Signed webhooks (HMAC-SHA256, `t=...,v1=...` header) for `recording.synced`, `recording.updated`, `recording.deleted`, `transcription.completed`, `transcription.failed` with URL + secret encrypted at rest, exponential backoff (30s -> 6h, then dead), DB-leased worker, manual redelivery, and a deliveries inspector. Webhook target policy switches on `WEBHOOKS_REQUIRE_PUBLIC_TARGETS ?? IS_HOSTED`: self-host defaults permissive so docker-bridge URLs like `http://n8n:5678/webhook` keep working. Full reference in `docs/API.md` ([#118](https://github.com/openplaud/openplaud/pull/118)).
-- Documentation site at `/docs` with Guides, Self Hosting, and Reference sections (fumadocs-mdx). `/llms.txt` and `/llms-full.txt` routes for LLM-friendly access ([#131](https://github.com/openplaud/openplaud/pull/131)).
-- Dashboard waveform player: client-side AudioContext decode on first listen, peaks cached server-side in `recordings.waveform_peaks`, canvas renderer with hover timestamp and vertical playhead. Auto-decode capped at 30min with a manual "Generate waveform" button above that. New `user_settings.player_scrubber` preference (`waveform` | `slider`) with toggle in Playback settings ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Command palette (Cmd/Ctrl+K) for sync, upload, settings, theme, and recording typeahead with fuzzy search over filenames and transcript text. Inline `Transcribe` quick-action on audio-only rows; Cmd+Enter triggers transcribe on the highlighted row without closing the palette. Keyboard shortcuts cheatsheet (`?`), `j`/`k` list nav, `/` for search focus, `,` for settings ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Recording list redesign: search, sort + density toggles, date-grouped rows with sticky headers, status chips (transcript / summary / in-flight), per-row delete via hover menu, infinite-scroll sentinel replacing Prev/Next, optimistic upload and delete. New `user_settings.list_density` preference ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Settings redesign with grouped sidebar nav (Providers / Plaud / Personalize / Data / Integrations / Advanced), new primitives (`SettingsSectionHeader`, `SettingsCard`, `ToggleRow`), hash routing, and a master-detail mobile layout. New Storage section with usage hero, per-status breakdown bar, and top-5 largest-recordings list with deep links ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Running version shown in the footer as a link to its release notes. Self-host instances also see an "update available" badge when a newer GitHub release exists (cached 5 minutes, fails silently). New optional `DISABLE_UPDATE_CHECK` env var for instances that block outbound HTTPS or want zero phone-home. `/api/health` response gains an additive `version` field ([#124](https://github.com/openplaud/openplaud/pull/124), [#123](https://github.com/openplaud/openplaud/issues/123)).
-- Footer "Report a bug" button and toast `[Report]` action that pre-fill a GitHub issue with an `errorId` correlation token (and an "Email us" option on hosted). Every response with HTTP status >= 500 now carries `details.errorId` (`err_xxxxxxxx`) tying the JSON envelope to a single `console.error` log line, so users can quote it and support can grep logs. Connect / verify / paste-token error sites in `plaud-connect-tabs` migrated to `toastApiError` so the Report action lights up on 5xx ([#143](https://github.com/openplaud/openplaud/pull/143)).
-- `/install` page with copyable curl one-liner and version-pinned form, plus a "View raw script" escape hatch -- replaces the previous footer link that dumped raw shell into the browser. Reachable from the footer in both self-host and hosted ([#125](https://github.com/openplaud/openplaud/pull/125)).
+- Automation API: versioned `/api/v1/recordings` namespace for external agents (list with cursor pagination + `created_since` / `updated_since` / `has_transcription` filters, get, transcript, metadata, audio redirect). Personal API keys (`op_...` prefix, HMAC-SHA256 hashed at rest keyed by `API_TOKEN_HASH_SECRET ?? BETTER_AUTH_SECRET`, revocable, with `source` / `name` / `lastUsedAt` metadata) managed from Settings. Per-IP and per-identity rate limits on `/api/v1/*` (1200/min IP, 600/min identity) with `Retry-After` and `X-RateLimit-*` headers. Signed webhooks (HMAC-SHA256, `t=...,v1=...` header) for `recording.synced`, `recording.updated`, `recording.deleted`, `transcription.completed`, `transcription.failed` with URL + secret encrypted at rest, exponential backoff (30s -> 6h, then dead), DB-leased worker, manual redelivery, and a deliveries inspector. Webhook target policy switches on `WEBHOOKS_REQUIRE_PUBLIC_TARGETS ?? IS_HOSTED`: self-host defaults permissive so docker-bridge URLs like `http://n8n:5678/webhook` keep working. Full reference in `docs/API.md` ([#118](https://github.com/riffado/riffado/pull/118)).
+- Documentation site at `/docs` with Guides, Self Hosting, and Reference sections (fumadocs-mdx). `/llms.txt` and `/llms-full.txt` routes for LLM-friendly access ([#131](https://github.com/riffado/riffado/pull/131)).
+- Dashboard waveform player: client-side AudioContext decode on first listen, peaks cached server-side in `recordings.waveform_peaks`, canvas renderer with hover timestamp and vertical playhead. Auto-decode capped at 30min with a manual "Generate waveform" button above that. New `user_settings.player_scrubber` preference (`waveform` | `slider`) with toggle in Playback settings ([#121](https://github.com/riffado/riffado/pull/121)).
+- Command palette (Cmd/Ctrl+K) for sync, upload, settings, theme, and recording typeahead with fuzzy search over filenames and transcript text. Inline `Transcribe` quick-action on audio-only rows; Cmd+Enter triggers transcribe on the highlighted row without closing the palette. Keyboard shortcuts cheatsheet (`?`), `j`/`k` list nav, `/` for search focus, `,` for settings ([#121](https://github.com/riffado/riffado/pull/121)).
+- Recording list redesign: search, sort + density toggles, date-grouped rows with sticky headers, status chips (transcript / summary / in-flight), per-row delete via hover menu, infinite-scroll sentinel replacing Prev/Next, optimistic upload and delete. New `user_settings.list_density` preference ([#121](https://github.com/riffado/riffado/pull/121)).
+- Settings redesign with grouped sidebar nav (Providers / Plaud / Personalize / Data / Integrations / Advanced), new primitives (`SettingsSectionHeader`, `SettingsCard`, `ToggleRow`), hash routing, and a master-detail mobile layout. New Storage section with usage hero, per-status breakdown bar, and top-5 largest-recordings list with deep links ([#121](https://github.com/riffado/riffado/pull/121)).
+- Running version shown in the footer as a link to its release notes. Self-host instances also see an "update available" badge when a newer GitHub release exists (cached 5 minutes, fails silently). New optional `DISABLE_UPDATE_CHECK` env var for instances that block outbound HTTPS or want zero phone-home. `/api/health` response gains an additive `version` field ([#124](https://github.com/riffado/riffado/pull/124), [#123](https://github.com/riffado/riffado/issues/123)).
+- Footer "Report a bug" button and toast `[Report]` action that pre-fill a GitHub issue with an `errorId` correlation token (and an "Email us" option on hosted). Every response with HTTP status >= 500 now carries `details.errorId` (`err_xxxxxxxx`) tying the JSON envelope to a single `console.error` log line, so users can quote it and support can grep logs. Connect / verify / paste-token error sites in `plaud-connect-tabs` migrated to `toastApiError` so the Report action lights up on 5xx ([#143](https://github.com/riffado/riffado/pull/143)).
+- `/install` page with copyable curl one-liner and version-pinned form, plus a "View raw script" escape hatch -- replaces the previous footer link that dumped raw shell into the browser. Reachable from the footer in both self-host and hosted ([#125](https://github.com/riffado/riffado/pull/125)).
 
 ### Changed
-- API key format adopts base62 + CRC32 checksum (`op_<base62-secret><crc32>`). New keys are 1 character shorter, checksum-validated before any DB lookup, so malformed input is rejected early. Existing keys continue to work unchanged ([#139](https://github.com/openplaud/openplaud/pull/139)).
-- Sticky page header with consolidated user menu (email-initial avatar, inline 3-button theme control, identity block, kbd hints). Status-aware sync button replaces the separate status block + button -- label cycles `Synced 2m ago` / `Sync device` / `Syncing...` / `Retry sync` with tooltip carrying next-auto-sync ETA or error message ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Shared imperative confirm dialog (`useConfirm()`) replaces ad-hoc destructive-action confirmations across recording delete, webhook delete, custom-prompt delete, and provider delete. One dialog UI for every destructive action ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- React 19 cleanup pass: `forwardRef` -> ref-as-prop, `useContext` -> `use()`, em dashes replaced with commas/colons/periods in user-facing copy, display headings tightened to `font-semibold`, hydration mismatch on locale-formatted timestamps fixed via a new `<LocalTime>` component, plus component splits (workstation, settings dialog, providers section, webhooks section, command palette, recording player, onboarding) to drop giant-component sizes. SEO metadata added for `/` and `/suspended` ([#138](https://github.com/openplaud/openplaud/pull/138)).
-- Theme system rewritten as a thin wrapper over `next-themes` to fix Radix `useId` hydration drift on Next 16. `middleware.ts` renamed to `proxy.ts` for the Next 16 entrypoint change. Behavior unchanged ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Release pipeline hardened against tag/version drift: `scripts/release.ts` creates both the release commit and the `[Unreleased]` cycle commit, then pushes `main` and the tag atomically; the release workflow now hard-gates on `package.json` version matching the pushed tag and checks out the tagged ref ([#124](https://github.com/openplaud/openplaud/pull/124), [#123](https://github.com/openplaud/openplaud/issues/123)).
-- Footer split: minimal in-app footer (logo, AGPL, version + update badge, GitHub, hosted-only Support) for signed-in screens, and a separate hosted-only `LandingFooter` (Product / Resources / Company / Legal columns + honesty rail disclaiming HIPAA / SOC 2 certification) for marketing surfaces. Self-host always sees the minimal footer ([#125](https://github.com/openplaud/openplaud/pull/125)).
+- API key format adopts base62 + CRC32 checksum (`op_<base62-secret><crc32>`). New keys are 1 character shorter, checksum-validated before any DB lookup, so malformed input is rejected early. Existing keys continue to work unchanged ([#139](https://github.com/riffado/riffado/pull/139)).
+- Sticky page header with consolidated user menu (email-initial avatar, inline 3-button theme control, identity block, kbd hints). Status-aware sync button replaces the separate status block + button -- label cycles `Synced 2m ago` / `Sync device` / `Syncing...` / `Retry sync` with tooltip carrying next-auto-sync ETA or error message ([#121](https://github.com/riffado/riffado/pull/121)).
+- Shared imperative confirm dialog (`useConfirm()`) replaces ad-hoc destructive-action confirmations across recording delete, webhook delete, custom-prompt delete, and provider delete. One dialog UI for every destructive action ([#121](https://github.com/riffado/riffado/pull/121)).
+- React 19 cleanup pass: `forwardRef` -> ref-as-prop, `useContext` -> `use()`, em dashes replaced with commas/colons/periods in user-facing copy, display headings tightened to `font-semibold`, hydration mismatch on locale-formatted timestamps fixed via a new `<LocalTime>` component, plus component splits (workstation, settings dialog, providers section, webhooks section, command palette, recording player, onboarding) to drop giant-component sizes. SEO metadata added for `/` and `/suspended` ([#138](https://github.com/riffado/riffado/pull/138)).
+- Theme system rewritten as a thin wrapper over `next-themes` to fix Radix `useId` hydration drift on Next 16. `middleware.ts` renamed to `proxy.ts` for the Next 16 entrypoint change. Behavior unchanged ([#121](https://github.com/riffado/riffado/pull/121)).
+- Release pipeline hardened against tag/version drift: `scripts/release.ts` creates both the release commit and the `[Unreleased]` cycle commit, then pushes `main` and the tag atomically; the release workflow now hard-gates on `package.json` version matching the pushed tag and checks out the tagged ref ([#124](https://github.com/riffado/riffado/pull/124), [#123](https://github.com/riffado/riffado/issues/123)).
+- Footer split: minimal in-app footer (logo, AGPL, version + update badge, GitHub, hosted-only Support) for signed-in screens, and a separate hosted-only `LandingFooter` (Product / Resources / Company / Legal columns + honesty rail disclaiming HIPAA / SOC 2 certification) for marketing surfaces. Self-host always sees the minimal footer ([#125](https://github.com/riffado/riffado/pull/125)).
 
 ### Fixed
-- Install `git` in the Docker builder so fumadocs-mdx's `lastModified` plugin can read commit timestamps; without it the docs build fell back to mtime and emitted noisy warnings ([#140](https://github.com/openplaud/openplaud/pull/140)).
-- Send browser `User-Agent` on all Plaud API requests. Plaud's edge started 403-ing non-browser UAs, breaking sync on certain regional servers ([#136](https://github.com/openplaud/openplaud/pull/136), [#132](https://github.com/openplaud/openplaud/issues/132)).
-- Run fumadocs-mdx codegen in the Docker builder stage instead of via `postinstall`, so generated MDX bindings ship inside the runtime image and `/docs` doesn't 500 on cold containers ([#134](https://github.com/openplaud/openplaud/pull/134)).
-- Send `chunking_strategy` for diarization-capable transcription models, and consolidate the manual-transcribe and sync-transcribe code paths so they agree on request shape. Fixes diarize-model failures on long recordings ([#128](https://github.com/openplaud/openplaud/pull/128), [#101](https://github.com/openplaud/openplaud/issues/101)).
-- OpenRouter transcription now routes through chat-completions (OpenRouter does not expose `/audio/transcriptions`), and the provider preset ships a curated list of transcription-capable models so the picker doesn't surface chat-only models that would 404 at request time ([#126](https://github.com/openplaud/openplaud/pull/126), [#122](https://github.com/openplaud/openplaud/issues/122)).
-- Player time label no longer resizes mid-playback. `formatTimeLike(current, reference)` pads `currentTime` to match `duration`'s segment structure (`M:SS` / `MM:SS` / `H:MM:SS`) so the clock label keeps a stable width ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- Webhook worker no longer skews due-delivery comparisons under Bun: `nowParam` is cast to `::timestamp` to match the `next_attempt_at` column type ([#121](https://github.com/openplaud/openplaud/pull/121)).
-- DELETE recording locks the parent row with `SELECT ... FOR UPDATE` at the start of the transaction, so a concurrent transcribe or summary write can't leave orphan child rows pointing at a tombstoned recording. Sync re-checks the tombstone under `FOR UPDATE` before its update + emit, preventing delete-during-download races from resurrecting a recording ([#118](https://github.com/openplaud/openplaud/pull/118)).
-- Plaud helpers (`plaudSendCode`, `plaudVerifyOtp`, `listPlaudWorkspaces`, `mintPlaudWorkspaceToken`) parse upstream JSON defensively via a new `safeParseJson`. Cloudflare WAF HTML challenge pages (and other non-JSON upstream bodies) previously escaped as raw `SyntaxError` and flattened to a generic `INTERNAL_ERROR (500)`; they now surface as typed `PLAUD_INVALID_TOKEN` / `PLAUD_RATE_LIMITED` / `PLAUD_UPSTREAM_ERROR` / `PLAUD_API_ERROR` with the upstream HTTP status and a 200-char body snippet in `details` ([#143](https://github.com/openplaud/openplaud/pull/143), [#142](https://github.com/openplaud/openplaud/issues/142), [#137](https://github.com/openplaud/openplaud/issues/137)).
+- Install `git` in the Docker builder so fumadocs-mdx's `lastModified` plugin can read commit timestamps; without it the docs build fell back to mtime and emitted noisy warnings ([#140](https://github.com/riffado/riffado/pull/140)).
+- Send browser `User-Agent` on all Plaud API requests. Plaud's edge started 403-ing non-browser UAs, breaking sync on certain regional servers ([#136](https://github.com/riffado/riffado/pull/136), [#132](https://github.com/riffado/riffado/issues/132)).
+- Run fumadocs-mdx codegen in the Docker builder stage instead of via `postinstall`, so generated MDX bindings ship inside the runtime image and `/docs` doesn't 500 on cold containers ([#134](https://github.com/riffado/riffado/pull/134)).
+- Send `chunking_strategy` for diarization-capable transcription models, and consolidate the manual-transcribe and sync-transcribe code paths so they agree on request shape. Fixes diarize-model failures on long recordings ([#128](https://github.com/riffado/riffado/pull/128), [#101](https://github.com/riffado/riffado/issues/101)).
+- OpenRouter transcription now routes through chat-completions (OpenRouter does not expose `/audio/transcriptions`), and the provider preset ships a curated list of transcription-capable models so the picker doesn't surface chat-only models that would 404 at request time ([#126](https://github.com/riffado/riffado/pull/126), [#122](https://github.com/riffado/riffado/issues/122)).
+- Player time label no longer resizes mid-playback. `formatTimeLike(current, reference)` pads `currentTime` to match `duration`'s segment structure (`M:SS` / `MM:SS` / `H:MM:SS`) so the clock label keeps a stable width ([#121](https://github.com/riffado/riffado/pull/121)).
+- Webhook worker no longer skews due-delivery comparisons under Bun: `nowParam` is cast to `::timestamp` to match the `next_attempt_at` column type ([#121](https://github.com/riffado/riffado/pull/121)).
+- DELETE recording locks the parent row with `SELECT ... FOR UPDATE` at the start of the transaction, so a concurrent transcribe or summary write can't leave orphan child rows pointing at a tombstoned recording. Sync re-checks the tombstone under `FOR UPDATE` before its update + emit, preventing delete-during-download races from resurrecting a recording ([#118](https://github.com/riffado/riffado/pull/118)).
+- Plaud helpers (`plaudSendCode`, `plaudVerifyOtp`, `listPlaudWorkspaces`, `mintPlaudWorkspaceToken`) parse upstream JSON defensively via a new `safeParseJson`. Cloudflare WAF HTML challenge pages (and other non-JSON upstream bodies) previously escaped as raw `SyntaxError` and flattened to a generic `INTERNAL_ERROR (500)`; they now surface as typed `PLAUD_INVALID_TOKEN` / `PLAUD_RATE_LIMITED` / `PLAUD_UPSTREAM_ERROR` / `PLAUD_API_ERROR` with the upstream HTTP status and a 200-char body snippet in `details` ([#143](https://github.com/riffado/riffado/pull/143), [#142](https://github.com/riffado/riffado/issues/142), [#137](https://github.com/riffado/riffado/issues/137)).
 
 ## [0.4.2] - 2026-05-09
 
 ### Fixed
-- `/admin/reauth` returned a permanent 404 in production Docker images even with `IS_HOSTED=true` and `ADMIN_EMAILS` configured, leaving admins unable to elevate their session. The page performed its `env.IS_HOSTED` / `env.ADMIN_EMAILS` `notFound()` checks before any dynamic API call, so `next build` (which doesn't see admin env by design) statically prerendered it as a 404 and baked that into the image. Every other admin page already declared `export const dynamic = "force-dynamic"`; reauth was the only miss. Added the directive ([#113](https://github.com/openplaud/openplaud/pull/113)).
+- `/admin/reauth` returned a permanent 404 in production Docker images even with `IS_HOSTED=true` and `ADMIN_EMAILS` configured, leaving admins unable to elevate their session. The page performed its `env.IS_HOSTED` / `env.ADMIN_EMAILS` `notFound()` checks before any dynamic API call, so `next build` (which doesn't see admin env by design) statically prerendered it as a 404 and baked that into the image. Every other admin page already declared `export const dynamic = "force-dynamic"`; reauth was the only miss. Added the directive ([#113](https://github.com/riffado/riffado/pull/113)).
 
 ## [0.4.1] - 2026-05-09
 
@@ -71,14 +195,14 @@
 ## [0.4.0] - 2026-05-09
 
 ### Added
-- Switch and disconnect Plaud account from Settings — new "Plaud Account" section shows the connected email + region, with **Switch account** (clears the connection and reopens the connect dialog) and **Disconnect** actions. Legacy connections without a stored email render as "Connected (email unknown)". Recordings are unaffected by either action ([#63](https://github.com/openplaud/openplaud/issues/63)).
+- Switch and disconnect Plaud account from Settings — new "Plaud Account" section shows the connected email + region, with **Switch account** (clears the connection and reopens the connect dialog) and **Disconnect** actions. Legacy connections without a stored email render as "Connected (email unknown)". Recordings are unaffected by either action ([#63](https://github.com/riffado/riffado/issues/63)).
 - Hosted-only admin dashboard at `/admin` with cost-attribution views (per-user storage, server transcription minutes, Plaud sync freshness, signup timeseries, pricing-snapshot CDFs) and a small set of audited operator actions (suspend / unsuspend user, force-disconnect Plaud, soft-delete recording). Gated by `IS_HOSTED=true` + `ADMIN_EMAILS` allowlist + signed elevated-session cookie (password reprompt) + optional `ADMIN_IP_ALLOWLIST`. Self-host instances 404 every admin route. Reads logged to `admin_audit_log`; mutations logged to `admin_action_log` with required reason text. Admins never see transcript text, summary text, audio, or decrypted secrets.
 - `users.suspendedAt` / `users.suspendedReason` columns supporting cooperative account suspension. Suspended users are redirected to `/suspended` on next request and skipped by the sync worker on next claim. Set/cleared exclusively by the admin suspend action; unused on self-host.
-- One-line self-host installer: `curl -fsSL https://openplaud.com/install.sh | sh`. Detects OS, verifies Docker + Compose v2, downloads `docker-compose.yml` and `env.example` from the matching GitHub release, generates `BETTER_AUTH_SECRET` / `ENCRYPTION_KEY` / `POSTGRES_PASSWORD`, starts the stack, and waits on `/api/health`. Version-pinned form available at `https://openplaud.com/vX.Y.Z/install.sh`. Source: [`scripts/install.sh`](scripts/install.sh) ([#95](https://github.com/openplaud/openplaud/issues/95)).
+- One-line self-host installer: `curl -fsSL https://riffado.com/install.sh | sh`. Detects OS, verifies Docker + Compose v2, downloads `docker-compose.yml` and `env.example` from the matching GitHub release, generates `BETTER_AUTH_SECRET` / `ENCRYPTION_KEY`, starts the stack, and waits on `/api/health`. Version-pinned form available at `https://riffado.com/vX.Y.Z/install.sh`. Source: [`scripts/install.sh`](scripts/install.sh) ([#95](https://github.com/riffado/riffado/issues/95)).
 
 ### Changed
 - `requireAuth()` now performs a suspension check on every authenticated server-component render, and a new `requireApiSession()` helper applies the same check (plus the unified `AppError` envelope) on all user-data API routes. Self-host fast-path: column is always null so the check is a single PK lookup with no behavioral change.
-- `docker-compose.yml` now reads `POSTGRES_PASSWORD` from the environment (default `postgres`, preserving existing deploys). The new installer generates a random value; existing self-host operators can rotate by setting `POSTGRES_PASSWORD` in `.env`, recreating the `db` volume, and restoring from a backup ([#95](https://github.com/openplaud/openplaud/issues/95)).
+- `docker-compose.yml` now reads `POSTGRES_PASSWORD` from the environment (default `postgres`, preserving existing deploys) ([#95](https://github.com/riffado/riffado/issues/95)).
 
 ### Security
 - User content is now encrypted at rest with AES-256-GCM keyed off `ENCRYPTION_KEY`. Covers `recordings.filename`, `transcriptions.text`, `ai_enhancements.{summary, key_points, action_items}`, and `user_settings.{summary_prompt, title_generation_prompt}`. Defends against database-only compromise (stolen backups, snapshot leaks, read-replica access). Does **not** make hosted operators unable to read content — the server still decrypts at request time to run transcription and summarization. Self-host with browser/local AI for true zero-knowledge. Pre-existing rows stay plaintext until rewritten or backfilled; run `bun scripts/encrypt-backfill.ts` once after upgrading to encrypt history. Full threat model in [docs/encryption-at-rest.md](docs/encryption-at-rest.md).
@@ -86,21 +210,21 @@
 ## [0.3.0] - 2026-05-07
 
 ### Added
-- New connect screen with three methods: **Sign in with Plaud** (browser-extension bridge — the easy path), **Email code** (existing OTP flow), and **Paste token** (advanced fallback). Targets accounts created via Google or Apple sign-in on Plaud, where the OTP flow silently signs users into a separate empty shadow account and sync returns zero recordings ([#65](https://github.com/openplaud/openplaud/issues/65)).
-- Companion browser extension [openplaud/connector](https://github.com/openplaud/connector) (AGPL-3.0) detected by the connect screen via `window.__openplaudConnector`. Lets users sign in to Plaud the way they normally do — Google, Apple, or email/password — with no copy-pasting. The extension hands the resulting access token back to OpenPlaud via the new `/api/plaud/auth/connect-token` endpoint, which encrypts it (AES-256-GCM) and persists alongside any existing OTP-flow connections.
-- AI output language selector — choose the language for AI-generated summaries and titles, independent of the transcript's language ([#57](https://github.com/openplaud/openplaud/issues/57)).
-- Forgot/reset password flow with email-delivered reset links via better-auth. Login surfaces the "Forgot password?" link only when SMTP is configured; reset revokes all other sessions to limit damage from compromised credentials ([#82](https://github.com/openplaud/openplaud/issues/82)).
-- Delete recording action in the workstation UI ([#56](https://github.com/openplaud/openplaud/issues/56)).
-- `IS_HOSTED` env flag — set to `true` on the OpenPlaud-operated hosted instance to render the marketing landing page at `/`. Defaults to `false` so self-host instances no longer serve OpenPlaud's hosted-tier marketing surface ([#70](https://github.com/openplaud/openplaud/issues/70)).
-- `DISABLE_REGISTRATION` env flag — set to `true` to close a self-host instance to new sign-ups. Wired through better-auth's `disableSignUp`, the `/register` page, and the login footer link. Defaults to `false`, preserving current behavior ([#59](https://github.com/openplaud/openplaud/issues/59)).
+- New connect screen with three methods: **Sign in with Plaud** (browser-extension bridge — the easy path), **Email code** (existing OTP flow), and **Paste token** (advanced fallback). Targets accounts created via Google or Apple sign-in on Plaud, where the OTP flow silently signs users into a separate empty shadow account and sync returns zero recordings ([#65](https://github.com/riffado/riffado/issues/65)).
+- Companion browser extension [riffado/connector](https://github.com/riffado/connector) (AGPL-3.0) detected by the connect screen via `window.__riffadoConnector`. Lets users sign in to Plaud the way they normally do — Google, Apple, or email/password — with no copy-pasting. The extension hands the resulting access token back to Riffado via the new `/api/plaud/auth/connect-token` endpoint, which encrypts it (AES-256-GCM) and persists alongside any existing OTP-flow connections.
+- AI output language selector — choose the language for AI-generated summaries and titles, independent of the transcript's language ([#57](https://github.com/riffado/riffado/issues/57)).
+- Forgot/reset password flow with email-delivered reset links via better-auth. Login surfaces the "Forgot password?" link only when SMTP is configured; reset revokes all other sessions to limit damage from compromised credentials ([#82](https://github.com/riffado/riffado/issues/82)).
+- Delete recording action in the workstation UI ([#56](https://github.com/riffado/riffado/issues/56)).
+- `IS_HOSTED` env flag — set to `true` on the Riffado-operated hosted instance to render the marketing landing page at `/`. Defaults to `false` so self-host instances no longer serve Riffado's hosted-tier marketing surface ([#70](https://github.com/riffado/riffado/issues/70)).
+- `DISABLE_REGISTRATION` env flag — set to `true` to close a self-host instance to new sign-ups. Wired through better-auth's `disableSignUp`, the `/register` page, and the login footer link. Defaults to `false`, preserving current behavior ([#59](https://github.com/riffado/riffado/issues/59)).
 
 ### Changed
-- Logged-out visitors at `/` now redirect to `/login` instead of seeing the marketing landing page. This is the new default for self-host. Operators who want to keep the marketing surface (or who want to host a fork's own landing page) can set `IS_HOSTED=true` ([#70](https://github.com/openplaud/openplaud/issues/70)).
-- Audio duration is now parsed in JavaScript on upload instead of shelling out to `ffprobe`. The `ffprobe` binary is no longer required in the Docker image or on the host ([#58](https://github.com/openplaud/openplaud/issues/58)).
+- Logged-out visitors at `/` now redirect to `/login` instead of seeing the marketing landing page. This is the new default for self-host. Operators who want to keep the marketing surface (or who want to host a fork's own landing page) can set `IS_HOSTED=true` ([#70](https://github.com/riffado/riffado/issues/70)).
+- Audio duration is now parsed in JavaScript on upload instead of shelling out to `ffprobe`. The `ffprobe` binary is no longer required in the Docker image or on the host ([#58](https://github.com/riffado/riffado/issues/58)).
 
 ### Fixed
-- Plaud recording endpoints now mint a workspace-scoped token, fixing 403s on EU/APAC accounts where the OTP-flow access token lacks workspace permissions ([#66](https://github.com/openplaud/openplaud/issues/66)).
-- Settings now shows the instance storage type from the environment instead of a hardcoded value ([#78](https://github.com/openplaud/openplaud/pull/78) by [@sauerhosen](https://github.com/sauerhosen)).
+- Plaud recording endpoints now mint a workspace-scoped token, fixing 403s on EU/APAC accounts where the OTP-flow access token lacks workspace permissions ([#66](https://github.com/riffado/riffado/issues/66)).
+- Settings now shows the instance storage type from the environment instead of a hardcoded value ([#78](https://github.com/riffado/riffado/pull/78) by [@sauerhosen](https://github.com/sauerhosen)).
 
 ## [0.2.0] - 2026-04-28
 
@@ -111,7 +235,7 @@
 ### Added
 - `BRANCHING.md` — branching and release model.
 - `docker-compose.dev.yml` — overlay for building the image from local source.
-- `OPENPLAUD_VERSION` env var for pinning the image tag.
+- `RIFFADO_VERSION` env var for pinning the image tag.
 - GitHub Releases attach `docker-compose.yml` and `.env.example` as install artifacts.
 
 ### Security
@@ -137,7 +261,7 @@
 ## [0.1.0] - 2025-01-22
 
 ### Added
-- Initial release of OpenPlaud
+- Initial release of Riffado
 - Self-hosted alternative to Plaud's subscription service
 - Support for any OpenAI-compatible API (OpenAI, Groq, Together AI, OpenRouter, LM Studio, Ollama)
 - Browser-based transcription using Transformers.js (Whisper models)
@@ -167,9 +291,23 @@
 - Environment variable validation
 - Path traversal protection
 
-[unreleased]: https://github.com/openplaud/openplaud/compare/v0.4.1...HEAD
-[0.4.1]: https://github.com/openplaud/openplaud/releases/tag/v0.4.1
-[0.4.0]: https://github.com/openplaud/openplaud/releases/tag/v0.4.0
-[0.3.0]: https://github.com/openplaud/openplaud/releases/tag/v0.3.0
-[0.2.0]: https://github.com/openplaud/openplaud/releases/tag/v0.2.0
-[0.1.0]: https://github.com/openplaud/openplaud/releases/tag/v0.1.0
+[unreleased]: https://github.com/riffado/riffado/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/riffado/riffado/compare/v0.6.4...v0.7.0
+[0.6.4]: https://github.com/riffado/riffado/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/riffado/riffado/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/riffado/riffado/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/riffado/riffado/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/riffado/riffado/compare/v0.5.6...v0.6.0
+[0.5.6]: https://github.com/riffado/riffado/releases/tag/v0.5.6
+[0.5.5]: https://github.com/riffado/riffado/releases/tag/v0.5.5
+[0.5.4]: https://github.com/riffado/riffado/releases/tag/v0.5.4
+[0.5.3]: https://github.com/riffado/riffado/releases/tag/v0.5.3
+[0.5.2]: https://github.com/riffado/riffado/releases/tag/v0.5.2
+[0.5.1]: https://github.com/riffado/riffado/releases/tag/v0.5.1
+[0.5.0]: https://github.com/riffado/riffado/releases/tag/v0.5.0
+[0.4.2]: https://github.com/riffado/riffado/releases/tag/v0.4.2
+[0.4.1]: https://github.com/riffado/riffado/releases/tag/v0.4.1
+[0.4.0]: https://github.com/riffado/riffado/releases/tag/v0.4.0
+[0.3.0]: https://github.com/riffado/riffado/releases/tag/v0.3.0
+[0.2.0]: https://github.com/riffado/riffado/releases/tag/v0.2.0
+[0.1.0]: https://github.com/riffado/riffado/releases/tag/v0.1.0

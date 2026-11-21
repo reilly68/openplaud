@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { plaudConnections } from "@/db/schema";
 import { requireApiSession } from "@/lib/auth-server";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
+import type { PlaudClient } from "@/lib/plaud/client";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
 import { isPlaudProxyConfigured } from "@/lib/plaud/proxy";
 import { serverKeyFromApiBase } from "@/lib/plaud/servers";
@@ -30,13 +31,8 @@ export const GET = apiHandler(async (request: Request) => {
         return NextResponse.json({ connected: false });
     }
 
-    const client = await createPlaudClient(
-        connection.bearerToken,
-        connection.apiBase,
-        connection.workspaceId,
-    );
-
     const startedAt = Date.now();
+    let client: PlaudClient | null = null;
     let reachable = false;
     let deviceCount: number | null = null;
     let activeRecordingCount: number | null = null;
@@ -44,6 +40,7 @@ export const GET = apiHandler(async (request: Request) => {
     let errorMessage: string | null = null;
 
     try {
+        client = await createPlaudClient(connection);
         const [devices, active, trash] = await Promise.all([
             client.listDevices(),
             client.getRecordings(0, 1, 0),
@@ -53,46 +50,38 @@ export const GET = apiHandler(async (request: Request) => {
         deviceCount = devices.data_devices?.length ?? 0;
         activeRecordingCount =
             active.data_file_total ?? active.data_file_list?.length ?? 0;
-        trashedRecordingCount =
-            trash.data_file_total ?? trash.data_file_list?.length ?? 0;
+        trashedRecordingCount = client.usingPlaudV4
+            ? null
+            : (trash.data_file_total ?? trash.data_file_list?.length ?? 0);
     } catch (err) {
-        // Dev introspection — surface the underlying message in the body
-        // (this endpoint is gated behind NODE_ENV !== "production" above).
         errorMessage = err instanceof Error ? err.message : String(err);
     }
 
     const latencyMs = Date.now() - startedAt;
+    const resolvedWorkspaceId = client?.workspaceId;
 
     return NextResponse.json({
         connected: true,
         reachable,
         latencyMs,
         error: errorMessage,
-        // Whether outbound Plaud calls go through the Webshare residential
-        // proxy. Surfaced here so we can quickly tell, on a flagged-egress
-        // VPS, whether the proxy path is wired up.
         usingPlaudProxy: isPlaudProxyConfigured(),
         connection: {
             id: connection.id,
             apiBase: connection.apiBase,
             server: serverKeyFromApiBase(connection.apiBase),
             plaudEmail: connection.plaudEmail,
-            workspaceId: client.workspaceId ?? connection.workspaceId,
-            // "cache"      = used the stored workspaceId as-is
-            // "resolved"   = client discovered or replaced it (cache empty
-            //                or stale-cache rescue picked a different id)
-            // "unresolved" = nothing stored and nothing resolved (the UT
-            //                fallback path)
+            workspaceId: resolvedWorkspaceId ?? connection.workspaceId,
             workspaceIdSource:
-                client.workspaceId &&
-                client.workspaceId !== connection.workspaceId
+                resolvedWorkspaceId &&
+                resolvedWorkspaceId !== connection.workspaceId
                     ? "resolved"
                     : connection.workspaceId
                       ? "cache"
-                      : client.workspaceId
+                      : resolvedWorkspaceId
                         ? "resolved"
                         : "unresolved",
-            workspaceTokenFallback: client.usingUserTokenFallback,
+            workspaceTokenFallback: client?.usingUserTokenFallback ?? false,
             createdAt: connection.createdAt,
             updatedAt: connection.updatedAt,
         },

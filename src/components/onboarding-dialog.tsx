@@ -32,17 +32,27 @@ interface OnboardingDialogProps {
     open: boolean;
     onOpenChange: (open: boolean) => void;
     onComplete: () => void;
+    /**
+     * True when the user has not finished onboarding yet -- makes the
+     * dialog non-dismissible (no close button, Escape and outside-click
+     * are suppressed) so the flow can't be abandoned partway. False for
+     * the voluntary "Re-run Onboarding" re-entry from Settings, which
+     * stays dismissible like before.
+     */
+    mandatory?: boolean;
 }
 
 export function OnboardingDialog({
     open,
     onOpenChange,
     onComplete,
+    mandatory = false,
 }: OnboardingDialogProps) {
     const { refresh } = useRouter();
     const [step, setStep] = useState<OnboardingStep>("welcome");
     const [hasPlaudConnection, setHasPlaudConnection] = useState(false);
-    const [hasAiProvider, setHasAiProvider] = useState(false);
+    const [hasOwnProvider, setHasOwnProvider] = useState(false);
+    const [hasIncludedProvider, setHasIncludedProvider] = useState(false);
 
     // Probe whether the user already finished the Plaud connection in
     // a previous session, so re-entering the flow doesn't make them
@@ -66,10 +76,12 @@ export function OnboardingDialog({
         if (open && step === "ai-provider") {
             fetch("/api/settings/ai/providers")
                 .then((res) => res.json())
-                .then((data) => {
-                    if (data.providers && data.providers.length > 0) {
-                        setHasAiProvider(true);
-                    }
+                .then((data: { providers?: Array<{ managed?: boolean }> }) => {
+                    const providers = data.providers ?? [];
+                    // The included Mynah provider (managed) shouldn't count as
+                    // the user having brought their own — it's complimentary.
+                    setHasOwnProvider(providers.some((p) => !p.managed));
+                    setHasIncludedProvider(providers.some((p) => p.managed));
                 })
                 .catch(() => {});
         }
@@ -81,7 +93,8 @@ export function OnboardingDialog({
         if (!open) {
             setStep("welcome");
             setHasPlaudConnection(false);
-            setHasAiProvider(false);
+            setHasOwnProvider(false);
+            setHasIncludedProvider(false);
         }
     }, [open]);
 
@@ -109,10 +122,22 @@ export function OnboardingDialog({
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto sm:max-w-[600px]">
+            <DialogContent
+                className="max-w-2xl max-h-[90vh] overflow-y-auto sm:max-w-[600px]"
+                hideCloseButton={mandatory}
+                onEscapeKeyDown={(e) => {
+                    if (mandatory) e.preventDefault();
+                }}
+                onPointerDownOutside={(e) => {
+                    if (mandatory) e.preventDefault();
+                }}
+                onInteractOutside={(e) => {
+                    if (mandatory) e.preventDefault();
+                }}
+            >
                 <DialogHeader>
                     <DialogTitle className="text-2xl" hidden>
-                        Welcome to OpenPlaud
+                        Welcome to Riffado
                     </DialogTitle>
                 </DialogHeader>
 
@@ -127,7 +152,8 @@ export function OnboardingDialog({
                     )}
                     {step === "ai-provider" && (
                         <OnboardingStepAiProvider
-                            hasAiProvider={hasAiProvider}
+                            hasOwnProvider={hasOwnProvider}
+                            hasIncludedProvider={hasIncludedProvider}
                             onGoToSettings={() => {
                                 onOpenChange(false);
                                 window.location.href =
@@ -135,7 +161,11 @@ export function OnboardingDialog({
                             }}
                         />
                     )}
-                    {step === "complete" && <OnboardingStepComplete />}
+                    {step === "complete" && (
+                        <OnboardingStepComplete
+                            hasIncludedProvider={hasIncludedProvider}
+                        />
+                    )}
 
                     <DialogFooter className="gap-2 sm:gap-3 relative">
                         <div className="flex gap-2 flex-1">

@@ -10,6 +10,7 @@ import {
 } from "@/lib/auth-request";
 import { requireApiSession } from "@/lib/auth-server";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
+import { captureServerEvent } from "@/lib/posthog-server";
 
 function serializeApiKey(apiKey: typeof apiKeys.$inferSelect) {
     return {
@@ -110,6 +111,11 @@ export const POST = apiHandler(async (request: Request) => {
             expiresAt,
         })
         .returning();
+
+    await captureServerEvent({
+        distinctId: session.user.id,
+        event: "api_key_created",
+    });
 
     return NextResponse.json(
         {

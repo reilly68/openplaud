@@ -12,6 +12,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `@/lib/errors` captures 5xx via `@/lib/posthog-server`, which imports
+// `@/lib/env` -- eagerly validated at module load and unrelated to what
+// this test covers (the error envelope itself, not capture behavior).
+vi.mock("@/lib/posthog-server", () => ({
+    captureServerException: vi.fn(),
+    captureServerEvent: vi.fn(),
+}));
+
 import {
     AppError,
     apiHandler,
@@ -60,12 +69,23 @@ describe("mapErrorToAppError", () => {
         expect(r.message).toBe("Invalid file path detected");
     });
 
-    it("maps unique-constraint -> UNIQUE_CONSTRAINT_VIOLATION 409", () => {
+    it("maps Postgres SQLSTATE 23505 -> UNIQUE_CONSTRAINT_VIOLATION 409", () => {
+        const pgError = new Error("duplicate key value violates constraint");
+        (pgError as unknown as { code: string }).code = "23505";
+        const r = mapErrorToAppError(pgError);
+        expect(r.code).toBe(ErrorCode.UNIQUE_CONSTRAINT_VIOLATION);
+        expect(r.statusCode).toBe(409);
+    });
+
+    it("does NOT map a message merely containing 'unique'/'duplicate' without SQLSTATE 23505", () => {
+        // Regression guard: substring matching on the message used to
+        // silently downgrade an unrelated 500-class error to a 409 with
+        // no errorId and no log line. Only the real Postgres code counts.
         const r = mapErrorToAppError(
             new Error("unique constraint failed on column"),
         );
-        expect(r.code).toBe(ErrorCode.UNIQUE_CONSTRAINT_VIOLATION);
-        expect(r.statusCode).toBe(409);
+        expect(r.code).toBe(ErrorCode.INTERNAL_ERROR);
+        expect(r.statusCode).toBe(500);
     });
 
     it("maps legacy 'Plaud API error (429): ...' -> PLAUD_RATE_LIMITED 429", () => {
@@ -355,14 +375,16 @@ describe("errorId correlation", () => {
         expect(body.details?.errorId).toMatch(/^err_[0-9a-f]{8}$/);
     });
 
-    it("log line includes the errorId (apiHandler)", async () => {
+    it("log line includes the errorId, method, and route (apiHandler)", async () => {
         const handler = apiHandler(async () => {
             throw new Error("boom");
         });
-        await handler(new Request("http://x"), undefined);
+        await handler(new Request("http://x/api/thing"), undefined);
         expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
         const firstArg = consoleErrorSpy.mock.calls[0][0] as string;
-        expect(firstArg).toMatch(/^\[api\] \[err_[0-9a-f]{8}\]$/);
+        expect(firstArg).toMatch(
+            /^\[api\] \[err_[0-9a-f]{8}\] GET \/api\/thing$/,
+        );
     });
 
     it("errorResponse also attaches errorId on >=500", async () => {

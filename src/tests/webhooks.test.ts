@@ -15,7 +15,7 @@ import {
 } from "vitest";
 
 const mockEnv = vi.hoisted(() => ({
-    APP_URL: "https://openplaud.example",
+    APP_URL: "https://riffado.example",
     IS_HOSTED: false,
     WEBHOOKS_REQUIRE_PUBLIC_TARGETS: undefined as boolean | undefined,
 }));
@@ -123,6 +123,11 @@ vi.mock("@/lib/v1/serialize", () => ({
 
 import { db } from "@/db";
 import { recordings, webhookDeliveries, webhookEndpoints } from "@/db/schema";
+import {
+    drainPending,
+    resetStatusRecorderForTests,
+    setStatusRecordingEnabled,
+} from "@/lib/status/record";
 import { getV1RecordingDetailForUser } from "@/lib/v1/serialize";
 import {
     decryptWebhookSecret,
@@ -410,7 +415,7 @@ function normalizedSqlText(value: unknown): string {
 describe("webhooks", () => {
     beforeEach(() => {
         vi.clearAllMocks();
-        mockEnv.APP_URL = "https://openplaud.example";
+        mockEnv.APP_URL = "https://riffado.example";
         mockEnv.IS_HOSTED = false;
         mockEnv.WEBHOOKS_REQUIRE_PUBLIC_TARGETS = undefined;
         lastMockRequest = null;
@@ -645,10 +650,10 @@ describe("webhooks", () => {
             };
         };
         expect(requestBody.data?.api_url).toBe(
-            "https://openplaud.example/api/v1/recordings/rec-1",
+            "https://riffado.example/api/v1/recordings/rec-1",
         );
         expect(requestBody.data?.links?.transcript).toBe(
-            "https://openplaud.example/api/v1/recordings/rec-1/transcript",
+            "https://riffado.example/api/v1/recordings/rec-1/transcript",
         );
         expect(requestBody.data?.transcript).toMatchObject({
             preview: "x".repeat(500),
@@ -849,10 +854,10 @@ describe("webhooks", () => {
             deleted_at: deletedAt.toISOString(),
             transcript: null,
             summary: null,
-            api_url: "https://openplaud.example/api/v1/recordings/rec-1",
+            api_url: "https://riffado.example/api/v1/recordings/rec-1",
         });
         expect(requestBody.data?.links?.self).toBe(
-            "https://openplaud.example/api/v1/recordings/rec-1",
+            "https://riffado.example/api/v1/recordings/rec-1",
         );
         expect(updateChain.set).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -862,5 +867,80 @@ describe("webhooks", () => {
                 lastError: null,
             }),
         );
+    });
+
+    describe("webhooks status job", () => {
+        beforeEach(() => {
+            resetStatusRecorderForTests();
+            setStatusRecordingEnabled(true);
+        });
+
+        afterEach(() => {
+            setStatusRecordingEnabled(false);
+            vi.restoreAllMocks();
+        });
+
+        function webhooksRun() {
+            return (
+                drainPending().jobs.find((job) => job.job === "webhooks") ??
+                null
+            );
+        }
+
+        it("records no success for a run that delivered some webhooks and then failed", async () => {
+            const endpoint = endpointRow({
+                url: "encrypted:http://n8n:5678/webhook",
+            });
+            mockDueDeliveries([
+                { delivery: deliveryRow(), endpoint },
+                { delivery: deliveryRow({ id: "delivery-2" }), endpoint },
+            ]);
+            const updateChain = {
+                set: vi.fn().mockReturnValue({
+                    where: vi.fn().mockReturnValue({
+                        returning: vi
+                            .fn()
+                            .mockResolvedValue([{ id: "delivery-1" }]),
+                    }),
+                }),
+            };
+            (db.transaction as Mock)
+                .mockImplementationOnce(async (callback) => {
+                    await callback({
+                        update: vi.fn().mockReturnValue(updateChain),
+                    });
+                })
+                .mockRejectedValueOnce(new Error("db down"));
+            mockNodeResponse(httpRequest as unknown as Mock, 204, "");
+            vi.spyOn(console, "error").mockImplementation(() => {});
+
+            await deliverDueWebhooks();
+
+            expect(httpRequest).toHaveBeenCalledTimes(2);
+            expect(webhooksRun()).toMatchObject({
+                lastSuccessAt: null,
+                lastErrorAt: expect.any(Date),
+            });
+        });
+
+        it("records a success once the whole run completed", async () => {
+            mockDueDeliveries([
+                {
+                    delivery: deliveryRow(),
+                    endpoint: endpointRow({
+                        url: "encrypted:http://n8n:5678/webhook",
+                    }),
+                },
+            ]);
+            mockSuccessfulUpdates();
+            mockNodeResponse(httpRequest as unknown as Mock, 204, "");
+
+            await deliverDueWebhooks();
+
+            expect(webhooksRun()).toMatchObject({
+                lastSuccessAt: expect.any(Date),
+                lastErrorAt: null,
+            });
+        });
     });
 });

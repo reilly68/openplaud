@@ -4,18 +4,17 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { toast } from "sonner";
-import { Logo } from "@/components/icons/logo";
 import { MetalButton } from "@/components/metal-button";
-import { Panel } from "@/components/panel";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { resetPasswordMode } from "@/lib/auth/reset-password-mode";
 import { resetPassword } from "@/lib/auth-client";
 
 interface ResetPasswordFormProps {
     /**
      * Reset token from the email link. better-auth's GET `/reset-password/:token`
      * endpoint validates the verification token, then redirects the browser to
-     * the `callbackURL` we passed via `forgetPassword({ redirectTo })` with
+     * the `callbackURL` passed via `requestPasswordReset({ redirectTo })` with
      * either `?token=VALID_TOKEN` (success) or `?error=INVALID_TOKEN` (expired
      * or already-consumed). See better-auth `requestPasswordReset` source.
      */
@@ -23,6 +22,12 @@ interface ResetPasswordFormProps {
     error?: string;
 }
 
+/**
+ * Renders only the form body. Page chrome (logo, headings, panel,
+ * background) is owned by the route, which uses `resetPasswordMode()`
+ * (from `@/lib/auth/reset-password-mode`) to decide the appropriate
+ * title/subtitle.
+ */
 export function ResetPasswordForm({ token, error }: ResetPasswordFormProps) {
     const [password, setPassword] = useState("");
     const [confirmPassword, setConfirmPassword] = useState("");
@@ -32,22 +37,9 @@ export function ResetPasswordForm({ token, error }: ResetPasswordFormProps) {
     // No token in URL, or better-auth signaled an error on the callback --
     // either the user navigated here directly, the token expired, or the
     // link was tampered with (e.g. crafted URL with both `token` and `error`).
-    // Show an explanatory state rather than a form that's guaranteed to fail.
-    if (!token || error) {
+    if (resetPasswordMode(token, error) === "invalid") {
         return (
-            <Panel className="w-full max-w-md space-y-6">
-                <div className="flex items-center gap-3">
-                    <Logo className="size-10 shrink-0" />
-                    <div>
-                        <h1 className="text-2xl font-semibold tracking-tight">
-                            Invalid reset link
-                        </h1>
-                        <p className="text-sm text-muted-foreground">
-                            This link is missing or has expired.
-                        </p>
-                    </div>
-                </div>
-
+            <div className="space-y-6">
                 <div className="space-y-3 rounded-md border border-border bg-muted/40 p-4 text-sm text-muted-foreground">
                     {error?.toUpperCase() === "INVALID_TOKEN" ? (
                         <p>
@@ -70,7 +62,7 @@ export function ResetPasswordForm({ token, error }: ResetPasswordFormProps) {
                         Request a new link
                     </Link>
                 </div>
-            </Panel>
+            </div>
         );
     }
 
@@ -118,19 +110,7 @@ export function ResetPasswordForm({ token, error }: ResetPasswordFormProps) {
     };
 
     return (
-        <Panel className="w-full max-w-md space-y-6">
-            <div className="flex items-center gap-3">
-                <Logo className="size-10 shrink-0" />
-                <div>
-                    <h1 className="text-2xl font-semibold tracking-tight">
-                        Set a new password
-                    </h1>
-                    <p className="text-sm text-muted-foreground">
-                        Choose a password you don't use anywhere else.
-                    </p>
-                </div>
-            </div>
-
+        <div className="space-y-6">
             <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="space-y-2">
                     <Label htmlFor="password">New password</Label>
@@ -179,6 +159,6 @@ export function ResetPasswordForm({ token, error }: ResetPasswordFormProps) {
                     Back to sign in
                 </Link>
             </div>
-        </Panel>
+        </div>
     );
 }

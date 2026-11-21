@@ -2,77 +2,79 @@
 
 import { type PipelineType, pipeline } from "@xenova/transformers";
 
-// Disable local model cache in browser
-// @ts-expect-error
-self.ONNX_CACHE = false;
+type Pipe = Awaited<ReturnType<typeof pipeline>>;
 
-let transcriber: Awaited<ReturnType<typeof pipeline>> | null = null;
+const pipelines = new Map<string, Pipe>();
 
-// Initialize the transcription pipeline
-async function initTranscriber(model: string) {
-    if (!transcriber) {
-        transcriber = await pipeline(
-            "automatic-speech-recognition" as PipelineType,
-            model,
-            {
-                // Use CDN for models in browser
-                revision: "main",
-            },
-        );
+async function getTranscriber(model: string): Promise<Pipe> {
+    const cached = pipelines.get(model);
+    if (cached) {
+        return cached;
     }
-    return transcriber;
+
+    const pipe = await pipeline(
+        "automatic-speech-recognition" as PipelineType,
+        model,
+        {
+            revision: "main",
+            progress_callback: (data: { status?: string }) => {
+                if (data?.status === "progress") {
+                    self.postMessage({
+                        type: "progress",
+                        status: "loading-model",
+                    });
+                }
+            },
+        },
+    );
+    pipelines.set(model, pipe);
+    return pipe;
 }
 
-// Listen for messages from the main thread
-self.addEventListener("message", async (event) => {
-    const { type, audioData, model } = event.data;
+self.addEventListener("message", async (event: MessageEvent) => {
+    const { type, samples, model } = event.data ?? {};
 
-    if (type === "transcribe") {
-        try {
-            // Initialize transcriber with specified model
-            const pipe = await initTranscriber(model);
+    if (type !== "transcribe") {
+        return;
+    }
 
-            // Send progress updates
-            self.postMessage({ type: "progress", status: "transcribing" });
+    try {
+        const pipe = await getTranscriber(model);
 
-            // Perform transcription
-            type TranscriberResult = {
-                text: string;
-                chunks?: { language?: string }[];
-            };
+        self.postMessage({ type: "progress", status: "transcribing" });
 
-            type Transcriber = (
-                input: unknown,
-                options: {
-                    return_timestamps: boolean;
-                    chunk_length_s: number;
-                    stride_length_s: number;
-                },
-            ) => Promise<TranscriberResult>;
+        type TranscriberResult = {
+            text: string;
+            chunks?: { language?: string }[];
+        };
 
-            const result = await (pipe as Transcriber)(audioData, {
-                return_timestamps: false,
-                chunk_length_s: 30,
-                stride_length_s: 5,
-            });
+        type Transcriber = (
+            input: Float32Array,
+            options: {
+                return_timestamps: boolean;
+                chunk_length_s: number;
+                stride_length_s: number;
+            },
+        ) => Promise<TranscriberResult>;
 
-            // Send the result back to main thread
-            self.postMessage({
-                type: "complete",
-                text: result.text,
-                detectedLanguage: result.chunks?.[0]?.language || "en",
-            });
-        } catch (error) {
-            self.postMessage({
-                type: "error",
-                error:
-                    error instanceof Error
-                        ? error.message
-                        : "Transcription failed",
-            });
-        }
+        const result = await (pipe as Transcriber)(samples as Float32Array, {
+            return_timestamps: false,
+            chunk_length_s: 30,
+            stride_length_s: 5,
+        });
+
+        self.postMessage({
+            type: "complete",
+            text: result.text,
+            detectedLanguage: result.chunks?.[0]?.language ?? null,
+        });
+    } catch (error) {
+        self.postMessage({
+            type: "error",
+            error:
+                error instanceof Error ? error.message : "Transcription failed",
+        });
     }
 });
 
-// Signal that the worker is ready
 self.postMessage({ type: "ready" });

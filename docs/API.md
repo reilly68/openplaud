@@ -1,6 +1,6 @@
 # API Documentation
 
-OpenPlaud API reference for all endpoints.
+Riffado API reference for all endpoints.
 
 ## Base URL
 
@@ -100,7 +100,7 @@ Send a one-time verification code to the user's Plaud email. Handles regional re
 
 #### POST `/plaud/auth/verify`
 
-Verify the OTP code, obtain a long-lived access token from Plaud, and store the encrypted connection.
+Verify the OTP code, obtain the user token and refresh token (both valid 30 days) from Plaud, and store the encrypted connection.
 
 **Body:**
 ```json
@@ -122,7 +122,7 @@ Verify the OTP code, obtain a long-lived access token from Plaud, and store the 
 
 #### GET `/plaud/connection`
 
-Get current Plaud connection status.
+Get current Plaud connection status. Token values are never returned.
 
 **Response:**
 ```json
@@ -130,14 +130,20 @@ Get current Plaud connection status.
   "connected": true,
   "server": "eu",
   "plaudEmail": "user@example.com",
+  "needsReconnect": false,
+  "accessExpiresAt": "2025-01-23T12:00:00.000Z",
+  "sessionExpiresAt": "2025-02-21T12:00:00.000Z",
+  "autoRenews": true,
   "createdAt": "2025-01-22T12:00:00.000Z",
   "updatedAt": "2025-01-22T12:00:00.000Z"
 }
 ```
 
+`sessionExpiresAt` is when the Plaud sign-in ends and the user must reconnect. With `autoRenews`, Riffado refreshes the user token until then. Both expiries are `null` when unknown.
+
 #### DELETE `/plaud/connection`
 
-Disconnect the current Plaud account. Deletes the stored connection and device records; synced recordings are preserved in OpenPlaud storage.
+Disconnect the current Plaud account. Deletes the stored connection and device records; synced recordings are preserved in Riffado storage.
 
 **Response:**
 ```json
@@ -207,14 +213,36 @@ Get single recording by ID.
 
 #### GET `/recordings/[id]/audio`
 
-Stream audio file.
+Stream audio file, or download the original when `download=1` is set.
+
+**Query Parameters:**
+- `download` (optional): `1` / `true` / `yes` returns `Content-Disposition: attachment` with a filename derived from the recording title and the stored file extension. Range requests are ignored so the saved file is complete.
 
 **Headers:**
-- `Range`: Optional byte range (e.g., `bytes=0-1023`)
+- `Range`: Optional byte range (e.g., `bytes=0-1023`). Ignored when `download` is set.
 
 **Response:**
-- Content-Type: audio/mpeg, audio/opus, etc.
-- Supports HTTP range requests (206 Partial Content)
+- Content-Type: audio/mpeg, audio/mp4, audio/wav, etc.
+- Supports HTTP range requests (206 Partial Content) for playback
+- `Content-Disposition: attachment` when downloading
+
+#### PATCH `/recordings/[id]`
+
+Rename a recording. The new title is encrypted at rest. Does not rename the file on Plaud.
+
+**Body:**
+```json
+{
+  "filename": "Q4 planning"
+}
+```
+
+**Response:**
+```json
+{
+  "filename": "Q4 planning"
+}
+```
 
 #### POST `/recordings/[id]/transcribe`
 
@@ -304,7 +332,7 @@ Configure storage provider.
   "storageType": "s3",
   "s3Config": {
     "endpoint": "https://...",
-    "bucket": "openplaud",
+    "bucket": "riffado",
     "region": "us-east-1",
     "accessKeyId": "...",
     "secretAccessKey": "..."
@@ -504,7 +532,7 @@ Forwarding headers such as `X-Forwarded-For` are ignored unless
 `RATE_LIMIT_TRUST_PROXY_HEADERS=true`; only enable it behind a trusted reverse
 proxy that strips or overwrites client-supplied forwarding headers.
 
-When `RATE_LIMIT_TRUST_PROXY_HEADERS=false` or unset, OpenPlaud cannot derive a
+When `RATE_LIMIT_TRUST_PROXY_HEADERS=false` or unset, Riffado cannot derive a
 trusted client IP from the request. The unauthenticated IP limiter therefore
 uses one shared `"unknown"` bucket of 1,200 requests per minute for the whole
 instance. Authenticated identity limits still apply per API key/session at 600
@@ -529,13 +557,13 @@ Supported events:
 - `transcription.completed`
 - `transcription.failed`
 
-OpenPlaud signs each request with HMAC-SHA256:
+Riffado signs each request with HMAC-SHA256:
 
 ```http
-X-OpenPlaud-Event: transcription.completed
-X-OpenPlaud-Delivery: <delivery-id>
-X-OpenPlaud-Timestamp: 1778078610
-X-OpenPlaud-Signature: t=1778078610,v1=<hex hmac>
+X-Riffado-Event: transcription.completed
+X-Riffado-Delivery: <delivery-id>
+X-Riffado-Timestamp: 1778078610
+X-Riffado-Signature: t=1778078610,v1=<hex hmac>
 ```
 
 The signature input is:
@@ -574,7 +602,7 @@ Webhook transcript payloads include a bounded preview instead of the full text:
     "created_at": "2026-05-06T12:05:00.000Z"
   },
   "links": {
-    "transcript": "https://openplaud.example/api/v1/recordings/abc123/transcript"
+    "transcript": "https://riffado.example/api/v1/recordings/abc123/transcript"
   }
 }
 ```

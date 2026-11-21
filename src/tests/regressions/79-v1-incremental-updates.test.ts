@@ -9,6 +9,9 @@ const openAiMocks = vi.hoisted(() => ({
 // path under test) don't trip DATABASE_URL/ENCRYPTION_KEY runtime checks.
 const mockEnv = vi.hoisted(() => ({
     WEBSHARE_API_KEY: undefined as string | undefined,
+    WHISPER_MAX_BYTES: 24 * 1024 * 1024,
+    WHISPER_COMPRESS_BITRATE_KBPS: 12,
+    WHISPER_REQUEST_TIMEOUT_MS: 60 * 60 * 1000,
 }));
 vi.mock("@/lib/env", () => ({ env: mockEnv }));
 
@@ -132,6 +135,26 @@ function selectRows(rows: unknown[], captureWhere?: (expr: unknown) => void) {
                 captureWhere?.(expr);
                 return {
                     limit: vi.fn().mockResolvedValue(rows),
+                };
+            }),
+        }),
+    };
+}
+
+// The credentials lookup in `generate-summary.ts` / `generate-title.ts`
+// is a single `.orderBy()`-terminated query (no `.limit()`) that returns
+// every one of the user's credentials for in-memory enhancement-provider
+// selection.
+function selectRowsOrdered(
+    rows: unknown[],
+    captureWhere?: (expr: unknown) => void,
+) {
+    return {
+        from: vi.fn().mockReturnValue({
+            where: vi.fn((expr: unknown) => {
+                captureWhere?.(expr);
+                return {
+                    orderBy: vi.fn().mockResolvedValue(rows),
                 };
             }),
         }),
@@ -275,9 +298,8 @@ describe("Issue #79 - v1 incremental update timestamps", () => {
                 ),
             )
             .mockReturnValueOnce(selectRows([]))
-            .mockReturnValueOnce(selectRows([]))
             .mockReturnValueOnce(
-                selectRows([
+                selectRowsOrdered([
                     {
                         id: "creds-1",
                         provider: "openai",
@@ -344,9 +366,8 @@ describe("Issue #79 - v1 incremental update timestamps", () => {
                 ]),
             )
             .mockReturnValueOnce(selectRows([]))
-            .mockReturnValueOnce(selectRows([]))
             .mockReturnValueOnce(
-                selectRows([
+                selectRowsOrdered([
                     {
                         id: "creds-1",
                         provider: "openai",

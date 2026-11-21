@@ -2,6 +2,7 @@ import {
     differenceInDays,
     format,
     formatDistanceToNow,
+    isSameDay,
     isThisYear,
     isToday,
     isYesterday,
@@ -28,27 +29,28 @@ export function formatDateTime(
     }
 }
 
-/**
- * Bucket a date into a human group label for the recording list.
- * Buckets are stable and ordered newest → oldest:
- *   Today | Yesterday | This week | Earlier this month |
- *   <Month> for older within this year | <Month YYYY> for previous years.
- * The current-year buckets omit the year because the section header
- * "this year" is implicit and adding `2025` to every label is noise.
- *
- * Callers should preserve their existing sort order; this function only
- * returns a label, it does not re-sort.
- */
+/** Absolute local date and start–end time for a recording. */
+export function formatRecordingDateTimeRange(
+    start: Date | string,
+    durationMs: number,
+): string {
+    const startDate = typeof start === "string" ? new Date(start) : start;
+    const endDate = new Date(startDate.getTime() + durationMs);
+
+    if (isSameDay(startDate, endDate)) {
+        return `${format(startDate, "MMM d, yyyy · h:mm a")}–${format(endDate, "h:mm a")}`;
+    }
+
+    return `${format(startDate, "MMM d, yyyy · h:mm a")}–${format(endDate, "MMM d, yyyy · h:mm a")}`;
+}
+
+/** Recording-list group label: Today / Yesterday / This week / month / Month YYYY. */
 export function dateGroupLabel(date: Date | string): string {
     const d = typeof date === "string" ? new Date(date) : date;
     if (isToday(d)) return "Today";
     if (isYesterday(d)) return "Yesterday";
     const now = new Date();
     const days = differenceInDays(now, d);
-    // Guard for past-only: a future-dated recording (clock skew, bad
-    // device metadata) would otherwise land in "This week" because
-    // `days` would be negative. Future items fall through to the
-    // month/year buckets below, which is the right home for them.
     if (days >= 0 && days < 7) return "This week";
     if (
         d.getMonth() === now.getMonth() &&

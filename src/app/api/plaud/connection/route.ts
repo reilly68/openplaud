@@ -20,11 +20,23 @@ export const GET = apiHandler(async (request: Request) => {
     }
 
     const server = serverKeyFromApiBase(connection.apiBase);
+    const autoRenews =
+        connection.refreshToken != null &&
+        connection.invalidatedAt == null &&
+        (connection.sessionExpiresAt == null ||
+            connection.sessionExpiresAt.getTime() > Date.now());
 
     return NextResponse.json({
         connected: true,
         server,
         plaudEmail: connection.plaudEmail ?? null,
+        // True once Plaud has rejected the stored token during a sync; the UI
+        // uses this to prompt a reconnect. Cleared on the next good sync or
+        // on reconnect.
+        needsReconnect: connection.invalidatedAt != null,
+        accessExpiresAt: connection.accessExpiresAt,
+        sessionExpiresAt: connection.sessionExpiresAt,
+        autoRenews,
         createdAt: connection.createdAt,
         updatedAt: connection.updatedAt,
         // Include the raw URL so the UI can populate the custom field
@@ -37,7 +49,7 @@ export const GET = apiHandler(async (request: Request) => {
  *
  * Disconnects the current Plaud account for this user by deleting the
  * stored connection and its associated device rows. Synced recordings are
- * preserved — they remain in the user's OpenPlaud library.
+ * preserved — they remain in the user's Riffado library.
  */
 export const DELETE = apiHandler(async (request: Request) => {
     const session = await requireApiSession(request);

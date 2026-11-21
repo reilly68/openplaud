@@ -5,6 +5,7 @@ import { db } from "@/db";
 import { webhookEndpoints } from "@/db/schema";
 import { requireApiSession } from "@/lib/auth-server";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
+import { captureServerEvent } from "@/lib/posthog-server";
 import { WEBHOOK_EVENTS } from "@/lib/webhooks/emit";
 import {
     encryptWebhookSecret,
@@ -73,6 +74,12 @@ export const POST = apiHandler(async (request: Request) => {
             enabled: typeof body.enabled === "boolean" ? body.enabled : true,
         })
         .returning();
+
+    await captureServerEvent({
+        distinctId: session.user.id,
+        event: "webhook_created",
+        properties: { event_types: events.length },
+    });
 
     return NextResponse.json(
         {

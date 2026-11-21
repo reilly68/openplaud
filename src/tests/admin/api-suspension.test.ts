@@ -16,6 +16,11 @@ const { dbMock, getSessionMock } = vi.hoisted(() => ({
     getSessionMock: vi.fn(),
 }));
 
+vi.mock("@/lib/posthog-server", () => ({
+    captureServerException: vi.fn(),
+    captureServerEvent: vi.fn(),
+}));
+
 vi.mock("@/db", () => ({ db: dbMock }));
 vi.mock("@/db/schema", () => ({
     users: { id: "users.id", suspendedAt: "users.suspendedAt" },

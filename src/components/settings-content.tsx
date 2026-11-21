@@ -3,48 +3,56 @@
 import type { SettingsSection } from "@/types/settings";
 import { ApiKeysSection } from "./settings/api-keys-section";
 import { WebhooksSection } from "./settings/webhooks-section";
+import { BillingSection } from "./settings-sections/billing-section";
 import { DevSection } from "./settings-sections/dev-section";
 import { DisplaySection } from "./settings-sections/display-section";
 import { ExportSection } from "./settings-sections/export-section";
 import { NotificationsSection } from "./settings-sections/notifications-section";
 import { PlaudAccountSection } from "./settings-sections/plaud-account-section";
 import { PlaybackSection } from "./settings-sections/playback-section";
-import { ProvidersSection } from "./settings-sections/providers-section";
+import {
+    type Provider,
+    ProvidersSection,
+} from "./settings-sections/providers-section";
 import { StorageSection } from "./settings-sections/storage-section";
 import { SummarySection } from "./settings-sections/summary-section";
 import { SyncSection } from "./settings-sections/sync-section";
 import { TranscriptionSection } from "./settings-sections/transcription-section";
 
-interface Provider {
-    id: string;
-    provider: string;
-    baseUrl: string | null;
-    defaultModel: string | null;
-    isDefaultTranscription: boolean;
-    isDefaultEnhancement: boolean;
-    createdAt: Date;
-}
-
-const EMPTY_PROVIDERS: Provider[] = [];
-
 interface SettingsContentProps {
     activeSection: SettingsSection;
-    initialProviders?: Provider[];
+    /** Forwarded to `ProvidersSection`; null while loading. */
+    providers: Provider[] | null;
+    /** Forwarded to `ProvidersSection`; see its prop doc. */
+    onProvidersChange: (providers: Provider[]) => void;
+    /** Forwarded to `ProvidersSection`; see its prop doc. */
+    providersLoadFailed?: boolean;
+    /** Forwarded to `ProvidersSection` as `onRetry`. */
+    onRetryProviders?: () => void;
     onReRunOnboarding?: () => void;
     isHosted?: boolean;
+    /** Forwarded to `PlaudAccountSection`; see its prop doc. */
+    onPlaudReconnected?: () => void;
 }
 
 export function SettingsContent({
     activeSection,
-    initialProviders = EMPTY_PROVIDERS,
+    providers,
+    onProvidersChange,
+    providersLoadFailed,
+    onRetryProviders,
     onReRunOnboarding,
     isHosted = false,
+    onPlaudReconnected,
 }: SettingsContentProps) {
     switch (activeSection) {
         case "providers":
             return (
                 <ProvidersSection
-                    initialProviders={initialProviders}
+                    providers={providers}
+                    onProvidersChange={onProvidersChange}
+                    loadFailed={providersLoadFailed}
+                    onRetry={onRetryProviders}
                     isHosted={isHosted}
                 />
             );
@@ -59,7 +67,7 @@ export function SettingsContent({
         case "sync":
             return <SyncSection />;
         case "plaud-account":
-            return <PlaudAccountSection />;
+            return <PlaudAccountSection onReconnected={onPlaudReconnected} />;
         case "playback":
             return <PlaybackSection />;
         case "display":
@@ -70,6 +78,9 @@ export function SettingsContent({
             return <ExportSection onReRunOnboarding={onReRunOnboarding} />;
         case "storage":
             return <StorageSection isHosted={isHosted} />;
+        case "billing":
+            if (!isHosted) return null;
+            return <BillingSection />;
         case "dev":
             if (process.env.NODE_ENV === "production") return null;
             return <DevSection />;

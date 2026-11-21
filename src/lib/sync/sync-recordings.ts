@@ -1,25 +1,58 @@
-import { and, eq, ne } from "drizzle-orm";
+import { createHash } from "node:crypto";
+import { and, eq, isNull, ne, notInArray, or } from "drizzle-orm";
 import { db } from "@/db";
-import { plaudConnections, recordings, userSettings, users } from "@/db/schema";
+import {
+    aiEnhancements,
+    plaudConnections,
+    recordings,
+    transcriptions,
+    userSettings,
+    users,
+} from "@/db/schema";
+import { sniffAudio } from "@/lib/audio/sniff";
 import { encryptText } from "@/lib/encryption/fields";
+import { isHostedLockedOut } from "@/lib/entitlements";
 import { env } from "@/lib/env";
+import { AppError, ErrorCode } from "@/lib/errors";
+import { enforceStorageCap } from "@/lib/hosted/billing/storage-cap";
 import { sendNewRecordingBarkNotification } from "@/lib/notifications/bark";
 import { sendNewRecordingEmail } from "@/lib/notifications/email";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
+import {
+    findInlineContent,
+    isReady,
+    parseSummary,
+    parseTranscript,
+    selectContentItems,
+} from "@/lib/plaud/content";
+import {
+    type MarkPlaudConnectionInvalidatedInput,
+    markPlaudConnectionInvalidated,
+} from "@/lib/plaud/persist-connection";
+import {
+    captureServerEvent,
+    captureServerException,
+} from "@/lib/posthog-server";
+import { deleteStorageObjectOrQueue } from "@/lib/storage/delete-object";
 import { createUserStorageProvider } from "@/lib/storage/factory";
+import {
+    claimAutoTranscribeIds,
+    listAutoTranscribeRetryIds,
+    noteAutoTranscribeOutcome,
+    recordAutoTranscribeStatus,
+    releaseAutoTranscribeIds,
+} from "@/lib/sync/auto-transcribe-state";
+import {
+    upsertEnhancement,
+    upsertTranscription,
+} from "@/lib/transcription/persist";
 import { transcribeRecording } from "@/lib/transcription/transcribe-recording";
 import { emitEvent } from "@/lib/webhooks/emit";
 import type { PlaudRecording } from "@/types/plaud";
 
-/**
- * Sync configuration constants
- */
 const SYNC_CONFIG = {
-    /** Number of recordings to fetch per API call */
     PAGE_SIZE: 50,
-    /** Number of recordings to download concurrently */
     BATCH_CONCURRENCY: 5,
-    /** Maximum pages to process in a single sync (prevents runaway) */
     MAX_PAGES: 20,
 } as const;
 
@@ -27,49 +60,89 @@ interface SyncResult {
     newRecordings: number;
     updatedRecordings: number;
     errors: string[];
-    /** IDs of recordings that need transcription */
     pendingTranscriptionIds: string[];
     /**
-     * True when this call coalesced into an already-running sync in the
-     * same process. Counts/IDs reflect that in-flight run, not a fresh
-     * one. Multi-process correctness is handled by the rate limiter at
-     * the route boundary (see `enforcePlaudSyncRateLimit`); this flag is
-     * only set within a single Node worker.
+     * Set when sync ended at one of the expected-state early returns
+     * (no connection yet, suspended, hosted lockout) rather than an
+     * operational failure. `errors` still carries the user-facing
+     * message for the client, but these aren't bugs -- the caller uses
+     * this to skip exception capture for them.
      */
+    skipped?: "no_connection" | "suspended" | "locked_out";
+    /** True when this call coalesced into an already-running in-process sync. */
     inProgress?: boolean;
+    /**
+     * True when Plaud rejected the stored token (HTTP 401) during this sync,
+     * so the user must reconnect. Surfaced to the client so the dashboard can
+     * show a reconnect banner.
+     */
+    needsReconnect?: boolean;
 }
 
-/**
- * Per-user in-flight sync promises. A second request for the same user
- * while a sync is running in the same process awaits the existing promise
- * rather than starting a parallel Plaud paginate + download pass. This is
- * the cheapest possible dedup layer; the per-user rate limit in the route
- * handler is the cross-process correctness backstop (AGENTS.md: in-memory
- * locks must not be the only correctness mechanism).
- */
+// Per-user in-flight dedup within one process. Cross-process correctness
+// is enforced by `enforcePlaudSyncRateLimit` at the route boundary.
 const inFlightSyncs = new Map<string, Promise<SyncResult>>();
 
 interface SyncContext {
     userId: string;
     autoTranscribe: boolean;
+    /** Master opt-in: import Plaud's native transcript/summary on sync (#204). */
+    importPlaudContent: boolean;
+    /** 'plaud_only' (default) | 'keep_both' — see runSyncRecordingsForUser. */
+    transcriptMode: string;
     emailNotifications: boolean;
     barkNotifications: boolean;
     notificationEmail: string | null;
     barkPushUrl: string | null;
 }
 
-/**
- * Generate a unique storage key for a recording, appending (2), (3) etc.
- * if another recording with the same name already exists in the DB.
- */
-async function uniqueStorageKey(
+/** A freshly-synced recording that Plaud may hold transcript/summary content
+ * for. Collected during the sync loop and drained by the import pass. */
+interface ImportCandidate {
+    recordingId: string;
+    plaudFileId: string;
+    isTrans: boolean;
+    isSummary: boolean;
+}
+
+const PG_FOREIGN_KEY_VIOLATION = "23503";
+
+function isForeignKeyViolation(error: unknown): boolean {
+    const code = (error as { code?: unknown })?.code;
+    const causeCode = (error as { cause?: { code?: unknown } })?.cause?.code;
+    return (
+        code === PG_FOREIGN_KEY_VIOLATION ||
+        causeCode === PG_FOREIGN_KEY_VIOLATION
+    );
+}
+
+async function storagePathReferenced(
     userId: string,
-    baseName: string,
-    ext: string,
+    storagePath: string,
+    exceptRecordingId?: string,
+): Promise<boolean> {
+    const conditions = [
+        eq(recordings.userId, userId),
+        eq(recordings.storagePath, storagePath),
+    ];
+    if (exceptRecordingId) {
+        conditions.push(ne(recordings.id, exceptRecordingId));
+    }
+    const [row] = await db
+        .select({ id: recordings.id })
+        .from(recordings)
+        .where(and(...conditions))
+        .limit(1);
+    return Boolean(row);
+}
+
+async function allocateStorageKey(
+    userId: string,
     plaudFileId: string,
+    ext: string,
 ): Promise<string> {
     const candidate = (suffix: string) =>
-        `${userId}/${baseName}${suffix}.${ext}`;
+        `${userId}/${plaudFileId}${suffix}.${ext}`;
 
     for (let i = 0; i < 100; i++) {
         const suffix = i === 0 ? "" : ` (${i + 1})`;
@@ -87,24 +160,266 @@ async function uniqueStorageKey(
             .limit(1);
         if (!existing) return key;
     }
-    // Absolute fallback: use the plaud ID
-    return `${userId}/${plaudFileId}.${ext}`;
+    throw new Error(
+        "Unable to allocate a unique storage key for Plaud recording",
+    );
+}
+
+async function resolveStorageKey(
+    userId: string,
+    existingRecording: { id: string; storagePath: string | null } | undefined,
+    fileExtension: string,
+    plaudFileId: string,
+    requireMatchingExtension: boolean,
+): Promise<{ key: string; replacedPath?: string }> {
+    const existingPath = existingRecording?.storagePath;
+    if (existingRecording && existingPath) {
+        if (
+            requireMatchingExtension &&
+            !existingPath.toLowerCase().endsWith(`.${fileExtension}`)
+        ) {
+            return {
+                key: await allocateStorageKey(
+                    userId,
+                    plaudFileId,
+                    fileExtension,
+                ),
+                replacedPath: existingPath,
+            };
+        }
+        const shared = await storagePathReferenced(
+            userId,
+            existingPath,
+            existingRecording.id,
+        );
+        if (!shared) return { key: existingPath };
+    }
+    return {
+        key: await allocateStorageKey(userId, plaudFileId, fileExtension),
+    };
+}
+
+async function deleteReplacedAudio(
+    storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
+    userId: string,
+    storagePath: string,
+    storageType: string,
+): Promise<void> {
+    if (storageType !== env.DEFAULT_STORAGE_TYPE) return;
+    try {
+        if (await storagePathReferenced(userId, storagePath)) return;
+        await storage.deleteFile(storagePath);
+    } catch (error) {
+        console.error(
+            `Failed to delete replaced storage object ${storagePath}:`,
+            error,
+        );
+        captureServerException(
+            new Error("Failed to delete replaced recording audio"),
+            { source: "sync:delete-replaced-audio", storageType },
+        );
+    }
+}
+
+async function deleteUnreferencedUpload(
+    storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
+    userId: string,
+    storagePath: string,
+): Promise<void> {
+    try {
+        if (await storagePathReferenced(userId, storagePath)) return;
+        await storage.deleteFile(storagePath);
+    } catch (error) {
+        console.error(
+            `Failed to clean up storage object ${storagePath} after a concurrent replace:`,
+            error,
+        );
+    }
+}
+
+interface RecordingMetadata {
+    deviceSn: string;
+    timezone: number | null;
+    zonemins: number | null;
+    scene: number | null;
+}
+
+function recordingMetadata(
+    plaudRecording: PlaudRecording,
+    existing: RecordingMetadata | undefined,
+): RecordingMetadata {
+    const listed = {
+        deviceSn: plaudRecording.serial_number,
+        timezone: plaudRecording.timezone,
+        zonemins: plaudRecording.zonemins,
+        scene: plaudRecording.scene,
+    };
+    if (!existing || plaudRecording.source !== "v4") return listed;
+    const zoneKnown = plaudRecording.timezone_iana !== undefined;
+    return {
+        deviceSn: listed.deviceSn || existing.deviceSn,
+        timezone: zoneKnown ? listed.timezone : existing.timezone,
+        zonemins: zoneKnown ? listed.zonemins : existing.zonemins,
+        scene: existing.scene,
+    };
 }
 
 /**
- * Process a single recording - download and save to database
+ * Build an import candidate for a freshly-synced recording, or `undefined`
+ * when there's nothing to import — the recording is trashed, or Plaud reports
+ * neither a transcript (`is_trans`) nor a summary (`is_summary`).
  */
-async function processRecording(
+function buildImportCandidate(
+    recordingId: string,
     plaudRecording: PlaudRecording,
+): ImportCandidate | undefined {
+    if (plaudRecording.is_trash) return undefined;
+    if (!plaudRecording.is_trans && !plaudRecording.is_summary) {
+        return undefined;
+    }
+    return {
+        recordingId,
+        plaudFileId: plaudRecording.id,
+        isTrans: plaudRecording.is_trans,
+        isSummary: plaudRecording.is_summary,
+    };
+}
+
+async function loadPlaudContentGaps(
+    userId: string,
+    recordingId: string,
+    flags: { isTrans: boolean; isSummary: boolean },
+): Promise<{
+    needsTranscript: boolean;
+    needsSummary: boolean;
+    hasPlaudTranscript: boolean;
+}> {
+    let needsTranscript = false;
+    let hasPlaudTranscript = false;
+    if (flags.isTrans) {
+        const [existing] = await db
+            .select({ id: transcriptions.id })
+            .from(transcriptions)
+            .where(
+                and(
+                    eq(transcriptions.recordingId, recordingId),
+                    eq(transcriptions.userId, userId),
+                    eq(transcriptions.source, "plaud"),
+                ),
+            )
+            .limit(1);
+        if (existing) hasPlaudTranscript = true;
+        else needsTranscript = true;
+    }
+
+    let needsSummary = false;
+    if (flags.isSummary) {
+        const [existing] = await db
+            .select({ id: aiEnhancements.id })
+            .from(aiEnhancements)
+            .where(
+                and(
+                    eq(aiEnhancements.recordingId, recordingId),
+                    eq(aiEnhancements.userId, userId),
+                ),
+            )
+            .limit(1);
+        if (!existing) needsSummary = true;
+    }
+
+    return { needsTranscript, needsSummary, hasPlaudTranscript };
+}
+
+async function hasUnseenPlaudContentGaps(
+    userId: string,
+    seenRecordingIds: Set<string>,
+): Promise<boolean> {
+    const conditions = [
+        eq(recordings.userId, userId),
+        isNull(recordings.deletedAt),
+        ne(recordings.deviceSn, "local"),
+        or(isNull(transcriptions.id), isNull(aiEnhancements.id)),
+    ];
+    if (seenRecordingIds.size > 0) {
+        conditions.push(notInArray(recordings.id, [...seenRecordingIds]));
+    }
+
+    const [row] = await db
+        .select({ id: recordings.id })
+        .from(recordings)
+        .leftJoin(
+            transcriptions,
+            and(
+                eq(transcriptions.recordingId, recordings.id),
+                eq(transcriptions.userId, userId),
+                eq(transcriptions.source, "plaud"),
+            ),
+        )
+        .leftJoin(
+            aiEnhancements,
+            and(
+                eq(aiEnhancements.recordingId, recordings.id),
+                eq(aiEnhancements.userId, userId),
+            ),
+        )
+        .where(and(...conditions))
+        .limit(1);
+
+    return Boolean(row);
+}
+
+/**
+ * Mutable per-sync-run flag. Once a new recording is blocked by the
+ * storage cap, every subsequent new recording in the same run is skipped
+ * without re-querying the user's byte total (new recordings only grow
+ * storage, so once over cap it stays over within the run). `pendingBytes`
+ * counts new recordings admitted by the cap but not yet persisted, so the
+ * concurrent recordings of a batch cannot all pass against the same total.
+ */
+interface CapState {
+    blocked: boolean;
+    pendingBytes: number;
+}
+
+async function reserveStorageBytes(
+    capState: CapState,
+    userId: string,
+    bytes: number,
+): Promise<boolean> {
+    capState.pendingBytes += bytes;
+    let allowed: boolean;
+    try {
+        ({ allowed } = await enforceStorageCap({
+            userId,
+            additionalBytes: capState.pendingBytes,
+        }));
+    } catch (error) {
+        capState.pendingBytes -= bytes;
+        throw error;
+    }
+    if (allowed) return true;
+    capState.pendingBytes -= bytes;
+    capState.blocked = true;
+    return false;
+}
+
+async function processRecording(
+    listedRecording: PlaudRecording,
     context: SyncContext,
     plaudClient: Awaited<ReturnType<typeof createPlaudClient>>,
     storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
+    capState: CapState,
+    seenRecordingIds: Set<string>,
 ): Promise<{
     status: "new" | "updated" | "skipped" | "error";
     recordingId?: string;
     filename?: string;
     error?: string;
+    importCandidate?: ImportCandidate;
+    capExceeded?: boolean;
 }> {
+    let plaudRecording = listedRecording;
+    let reservedBytes = 0;
     try {
         const [existingRecording] = await db
             .select()
@@ -117,114 +432,193 @@ async function processRecording(
             )
             .limit(1);
 
+        if (existingRecording) seenRecordingIds.add(existingRecording.id);
+
         const versionKey = plaudRecording.version_ms.toString();
 
-        // Skip if already synced with same version
         if (
             existingRecording &&
             existingRecording.plaudVersion === versionKey
         ) {
+            if (context.importPlaudContent && !existingRecording.deletedAt) {
+                const importCandidate = buildImportCandidate(
+                    existingRecording.id,
+                    plaudRecording,
+                );
+                if (importCandidate) {
+                    const gaps = await loadPlaudContentGaps(
+                        context.userId,
+                        existingRecording.id,
+                        {
+                            isTrans: importCandidate.isTrans,
+                            isSummary: importCandidate.isSummary,
+                        },
+                    );
+                    if (gaps.needsTranscript || gaps.needsSummary) {
+                        return {
+                            status: "skipped",
+                            recordingId: existingRecording.id,
+                            importCandidate,
+                        };
+                    }
+                }
+            }
             return { status: "skipped" };
         }
 
-        // Tombstone: user soft-deleted this recording in OpenPlaud's UI.
-        // Do not re-download or update — sync is keyed on plaudFileId, and
-        // the row is retained specifically to suppress resurrection. See #56.
+        // Tombstone: suppress resurrection of user-deleted recordings (#56).
         if (existingRecording?.deletedAt) {
             return { status: "skipped" };
         }
 
-        // Download the audio file
+        plaudRecording = await plaudClient.hydrateRecording(plaudRecording);
+
+        // Storage cap: gate NEW recordings before spending Plaud egress.
+        // Updates replace an existing blob (roughly size-neutral) and are
+        // left untouched so a near-cap user can still receive edits.
+        if (!existingRecording) {
+            if (capState.blocked) {
+                return { status: "skipped", capExceeded: true };
+            }
+            if (
+                !(await reserveStorageBytes(
+                    capState,
+                    context.userId,
+                    plaudRecording.filesize,
+                ))
+            ) {
+                return { status: "skipped", capExceeded: true };
+            }
+            reservedBytes += plaudRecording.filesize;
+        }
+
+        const isV4 = plaudRecording.source === "v4";
         const audioBuffer = await plaudClient.downloadRecording(
             plaudRecording.id,
             false,
         );
 
-        const fileExtension = "mp3";
-        const safeName =
-            plaudRecording.filename.replace(/[/\\:*?"<>|]/g, "-").trim() ||
-            plaudRecording.id;
-        const storageKey = await uniqueStorageKey(
+        if (!existingRecording) {
+            let unreservedBytes: number | undefined;
+            if (!plaudRecording.filesize) {
+                unreservedBytes = audioBuffer.length;
+            } else if (isV4 && audioBuffer.length > reservedBytes) {
+                unreservedBytes = audioBuffer.length - reservedBytes;
+            }
+            if (unreservedBytes !== undefined) {
+                if (
+                    !(await reserveStorageBytes(
+                        capState,
+                        context.userId,
+                        unreservedBytes,
+                    ))
+                ) {
+                    return { status: "skipped", capExceeded: true };
+                }
+                reservedBytes += unreservedBytes;
+            }
+        }
+
+        const sniffed = sniffAudio(audioBuffer);
+        const fileExtension = sniffed.extension;
+        const { key: storageKey, replacedPath } = await resolveStorageKey(
             context.userId,
-            safeName,
+            existingRecording,
             fileExtension,
             plaudRecording.id,
+            isV4,
         );
-        const contentType = "audio/mpeg";
+        const contentType = sniffed.contentType;
         await storage.uploadFile(storageKey, audioBuffer, contentType);
 
         const recordingData = {
             userId: context.userId,
-            deviceSn: plaudRecording.serial_number,
+            ...recordingMetadata(plaudRecording, existingRecording),
             plaudFileId: plaudRecording.id,
-            // Filename comes from Plaud as plaintext and may carry topic
-            // info; encrypt at rest. Notification surfaces below receive
-            // the original `plaudRecording.filename` directly, which is
-            // the right contract — the encrypted form never leaves the DB.
             filename: encryptText(plaudRecording.filename),
             duration: plaudRecording.duration,
             startTime: new Date(plaudRecording.start_time),
             endTime: new Date(plaudRecording.end_time),
-            filesize: plaudRecording.filesize,
-            fileMd5: plaudRecording.file_md5,
+            filesize: isV4
+                ? audioBuffer.length
+                : plaudRecording.filesize || audioBuffer.length,
+            fileMd5:
+                plaudRecording.file_md5 ||
+                createHash("md5").update(audioBuffer).digest("hex"),
             storageType: env.DEFAULT_STORAGE_TYPE,
             storagePath: storageKey,
             downloadedAt: new Date(),
             plaudVersion: versionKey,
-            timezone: plaudRecording.timezone,
-            zonemins: plaudRecording.zonemins,
-            scene: plaudRecording.scene,
             isTrash: plaudRecording.is_trash,
         };
 
         if (existingRecording) {
-            // The pre-download `select` happened before the slow
-            // download/upload above. A concurrent DELETE could have
-            // tombstoned the row in the meantime. Re-check under a row
-            // lock so we don't resurrect a deleted recording, and only
-            // emit `recording.updated` when we actually wrote.
-            const updated = await db.transaction(async (tx) => {
-                const [locked] = await tx
-                    .select({ deletedAt: recordings.deletedAt })
-                    .from(recordings)
-                    .where(
-                        and(
-                            eq(recordings.id, existingRecording.id),
-                            eq(recordings.userId, context.userId),
-                        ),
-                    )
-                    .for("update")
-                    .limit(1);
+            // Re-check under FOR UPDATE: a concurrent DELETE may have
+            // tombstoned the row during the download/upload above.
+            const outcome = await db.transaction(
+                async (tx): Promise<"updated" | "deleted" | "moved"> => {
+                    const [locked] = await tx
+                        .select({
+                            deletedAt: recordings.deletedAt,
+                            storagePath: recordings.storagePath,
+                        })
+                        .from(recordings)
+                        .where(
+                            and(
+                                eq(recordings.id, existingRecording.id),
+                                eq(recordings.userId, context.userId),
+                            ),
+                        )
+                        .for("update")
+                        .limit(1);
 
-                if (!locked || locked.deletedAt) return false;
+                    if (!locked || locked.deletedAt) return "deleted";
+                    if (locked.storagePath !== existingRecording.storagePath) {
+                        return "moved";
+                    }
 
-                await tx
-                    .update(recordings)
-                    .set({ ...recordingData, updatedAt: new Date() })
-                    .where(
-                        and(
-                            eq(recordings.id, existingRecording.id),
-                            eq(recordings.userId, context.userId),
-                        ),
-                    );
-                return true;
-            });
+                    await tx
+                        .update(recordings)
+                        .set({ ...recordingData, updatedAt: new Date() })
+                        .where(
+                            and(
+                                eq(recordings.id, existingRecording.id),
+                                eq(recordings.userId, context.userId),
+                                eq(
+                                    recordings.storagePath,
+                                    existingRecording.storagePath,
+                                ),
+                            ),
+                        );
+                    return "updated";
+                },
+            );
 
-            if (!updated) {
-                // Concurrent DELETE tombstoned the recording while we
-                // were downloading/uploading. The just-uploaded blob
-                // would otherwise be orphaned because we're no longer
-                // writing the recordings row that references it. Best
-                // effort cleanup; storage "already gone" is acceptable.
-                try {
-                    await storage.deleteFile(storageKey);
-                } catch (cleanupError) {
-                    console.error(
-                        `Failed to clean up orphaned storage object ${storageKey} after concurrent delete:`,
-                        cleanupError,
-                    );
-                }
+            if (outcome === "moved") {
+                await deleteUnreferencedUpload(
+                    storage,
+                    context.userId,
+                    storageKey,
+                );
                 return { status: "skipped" };
+            }
+
+            if (outcome === "deleted") {
+                await deleteStorageObjectOrQueue(
+                    storage,
+                    storageKey,
+                    "recording_cleanup",
+                );
+                return { status: "skipped" };
+            }
+
+            if (replacedPath) {
+                await deleteReplacedAudio(
+                    storage,
+                    context.userId,
+                    replacedPath,
+                    existingRecording.storageType,
+                );
             }
 
             await emitEvent(
@@ -236,16 +630,31 @@ async function processRecording(
                 status: "updated",
                 recordingId: existingRecording.id,
                 filename: plaudRecording.filename,
+                importCandidate: buildImportCandidate(
+                    existingRecording.id,
+                    plaudRecording,
+                ),
             };
         }
 
-        // Insert new recording. Concurrent inserts of the same plaud_file_id
-        // by parallel sync runs are caught by the (user_id, plaud_file_id)
-        // unique constraint and surface as an error to the caller.
-        const [newRecording] = await db
-            .insert(recordings)
-            .values(recordingData)
-            .returning({ id: recordings.id });
+        let newRecording: { id: string };
+        try {
+            [newRecording] = await db
+                .insert(recordings)
+                .values(recordingData)
+                .returning({ id: recordings.id });
+        } catch (insertError) {
+            if (isForeignKeyViolation(insertError)) {
+                await deleteStorageObjectOrQueue(
+                    storage,
+                    storageKey,
+                    "recording_cleanup",
+                );
+            }
+            throw insertError;
+        }
+
+        seenRecordingIds.add(newRecording.id);
 
         await emitEvent("recording.synced", context.userId, newRecording.id);
 
@@ -253,45 +662,69 @@ async function processRecording(
             status: "new",
             recordingId: newRecording.id,
             filename: plaudRecording.filename,
+            importCandidate: buildImportCandidate(
+                newRecording.id,
+                plaudRecording,
+            ),
         };
     } catch (error) {
         return {
             status: "error",
             error: `Failed to sync ${plaudRecording.filename}: ${error}`,
         };
+    } finally {
+        capState.pendingBytes -= reservedBytes;
     }
 }
 
-/**
- * Process a batch of recordings concurrently
- */
 async function processBatch(
     batch: PlaudRecording[],
     context: SyncContext,
     plaudClient: Awaited<ReturnType<typeof createPlaudClient>>,
     storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
+    capState: CapState,
+    seenRecordingIds: Set<string>,
 ): Promise<{
     newCount: number;
     updatedCount: number;
     errors: string[];
     newRecordingIds: string[];
     newRecordingNames: string[];
+    importCandidates: ImportCandidate[];
+    capExceeded: boolean;
 }> {
     const results = await Promise.allSettled(
         batch.map((rec) =>
-            processRecording(rec, context, plaudClient, storage),
+            processRecording(
+                rec,
+                context,
+                plaudClient,
+                storage,
+                capState,
+                seenRecordingIds,
+            ),
         ),
     );
 
     let newCount = 0;
     let updatedCount = 0;
+    let capExceeded = false;
     const errors: string[] = [];
     const newRecordingIds: string[] = [];
     const newRecordingNames: string[] = [];
+    const importCandidates: ImportCandidate[] = [];
 
     for (const result of results) {
         if (result.status === "fulfilled") {
-            const { status, recordingId, filename, error } = result.value;
+            const {
+                status,
+                recordingId,
+                filename,
+                error,
+                importCandidate,
+                capExceeded: ce,
+            } = result.value;
+            if (ce) capExceeded = true;
             if (status === "new" && recordingId) {
                 newCount++;
                 newRecordingIds.push(recordingId);
@@ -301,6 +734,7 @@ async function processBatch(
             } else if (status === "error" && error) {
                 errors.push(error);
             }
+            if (importCandidate) importCandidates.push(importCandidate);
         } else {
             errors.push(`Batch processing error: ${result.reason}`);
         }
@@ -312,38 +746,68 @@ async function processBatch(
         errors,
         newRecordingIds,
         newRecordingNames,
+        importCandidates,
+        capExceeded,
     };
 }
 
-/**
- * Sync recordings for a user with optimized batch processing
- *
- * Optimizations:
- * - Fetches recordings in pages (50 at a time)
- * - Downloads concurrently in batches (5 at a time)
- * - Queues transcription for after sync completes
- * - Stops early if no new recordings found
- * - In-process dedup: concurrent calls for the same user share one run
- */
+/** Paginated, batched sync. Coalesces concurrent same-user calls in-process. */
 export async function syncRecordingsForUser(
     userId: string,
+    trigger: "manual" | "background" = "manual",
 ): Promise<SyncResult> {
     const inFlight = inFlightSyncs.get(userId);
     if (inFlight) {
         const shared = await inFlight;
-        // Mark the coalesced response so the route handler / client can
-        // distinguish it from a fresh run. We deliberately do NOT mutate
-        // the in-flight result object (other awaiters share it).
         return { ...shared, inProgress: true };
     }
 
     const run = runSyncRecordingsForUser(userId);
     inFlightSyncs.set(userId, run);
     try {
-        return await run;
+        const result = await run;
+        // Bloat guard: only fire on syncs that actually changed something --
+        // a background cron tick with zero new/updated recordings is pure
+        // noise, not a usage signal.
+        if (result.newRecordings > 0 || result.updatedRecordings > 0) {
+            await captureServerEvent({
+                distinctId: userId,
+                event: "plaud_synced",
+                properties: {
+                    trigger,
+                    new_recordings: result.newRecordings,
+                    updated_recordings: result.updatedRecordings,
+                },
+            });
+        }
+        // `skipped` covers the expected-state early returns (no
+        // connection yet, suspended, hosted lockout) -- not bugs, so
+        // they don't get captured as exceptions even though `errors`
+        // carries a message for the client.
+        //
+        // Deliberately do NOT join `result.errors` into the exception
+        // message: per-recording failures embed the Plaud filename
+        // ("Failed to sync <filename>: ...", see processRecording's catch
+        // block) so callers can show a legible error in their own
+        // dashboard -- but that's client-matter-sensitive content (Slice
+        // 2 users are lawyers/journalists) that must never leave this
+        // process into third-party telemetry. Only a count crosses that
+        // boundary.
+        if (result.errors.length > 0 && !result.skipped) {
+            captureServerException(
+                new Error(
+                    `Sync completed with ${result.errors.length} error(s)`,
+                ),
+                {
+                    source: "sync",
+                    distinctId: userId,
+                    trigger,
+                    errorCount: result.errors.length,
+                },
+            );
+        }
+        return result;
     } finally {
-        // Always clear, even on throw, so a failed sync doesn't wedge the
-        // user out of future attempts.
         inFlightSyncs.delete(userId);
     }
 }
@@ -355,9 +819,9 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
         errors: [],
         pendingTranscriptionIds: [],
     };
+    let invalidationTarget: MarkPlaudConnectionInvalidatedInput | null = null;
 
     try {
-        // Get connection
         const [connection] = await db
             .select()
             .from(plaudConnections)
@@ -366,10 +830,10 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
 
         if (!connection) {
             result.errors.push("No Plaud connection found");
+            result.skipped = "no_connection";
             return result;
         }
 
-        // Get user settings
         const [settings] = await db
             .select()
             .from(userSettings)
@@ -385,19 +849,28 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             .where(eq(users.id, userId))
             .limit(1);
 
-        // Suspension check (cooperative). If an admin has suspended this user
-        // we exit before doing any work. In-flight syncs are not interrupted;
-        // this only stops the next claim. Self-host never sets suspendedAt
-        // because the admin gate is locked behind IS_HOSTED, so this branch
-        // is dead code there.
         if (user?.suspendedAt) {
             result.errors.push("User is suspended");
+            result.skipped = "suspended";
+            return result;
+        }
+
+        // Hosted lockout: a lapsed account is read-only. Existing data
+        // stays reachable; no new recordings are pulled until the user
+        // subscribes again. No-op on self-host.
+        if (await isHostedLockedOut(userId)) {
+            result.errors.push(
+                "Your hosted plan has lapsed. Subscribe to resume sync, or export your data.",
+            );
+            result.skipped = "locked_out";
             return result;
         }
 
         const context: SyncContext = {
             userId,
             autoTranscribe: settings?.autoTranscribe ?? false,
+            importPlaudContent: settings?.importPlaudContent ?? false,
+            transcriptMode: settings?.transcriptMode ?? "plaud_only",
             emailNotifications: settings?.emailNotifications ?? false,
             barkNotifications: settings?.barkNotifications ?? false,
             notificationEmail:
@@ -405,15 +878,23 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             barkPushUrl: settings?.barkPushUrl || null,
         };
 
-        const plaudClient = await createPlaudClient(
-            connection.bearerToken,
-            connection.apiBase,
-            connection.workspaceId,
-        );
+        const target: MarkPlaudConnectionInvalidatedInput = {
+            userId,
+            connectionId: connection.id,
+            bearerToken: connection.bearerToken,
+        };
+        invalidationTarget = target;
+        const plaudClient = await createPlaudClient(connection, {
+            onTokensStored: (bearerToken) => {
+                target.bearerToken = bearerToken;
+            },
+        });
         const storage = await createUserStorageProvider(userId);
         const allNewRecordingNames: string[] = [];
+        const importCandidates: ImportCandidate[] = [];
+        const capState: CapState = { blocked: false, pendingBytes: 0 };
+        const seenRecordingIds = new Set<string>();
 
-        // Paginated sync - fetch newest first
         let page = 0;
         let hasMore = true;
         let consecutiveEmptyPages = 0;
@@ -423,9 +904,9 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             const recordingsResponse = await plaudClient.getRecordings(
                 skip,
                 SYNC_CONFIG.PAGE_SIZE,
-                0, // not trash
+                0,
                 "edit_time",
-                true, // descending (newest first)
+                true,
             );
 
             const plaudRecordings = recordingsResponse.data_file_list;
@@ -434,7 +915,10 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                 break;
             }
 
-            // Process in concurrent batches
+            let pageNew = 0;
+            let pageUpdated = 0;
+            let pageCandidateCount = 0;
+
             for (
                 let i = 0;
                 i < plaudRecordings.length;
@@ -449,8 +933,13 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                     context,
                     plaudClient,
                     storage,
+                    capState,
+                    seenRecordingIds,
                 );
 
+                pageNew += batchResult.newCount;
+                pageUpdated += batchResult.updatedCount;
+                pageCandidateCount += batchResult.importCandidates.length;
                 result.newRecordings += batchResult.newCount;
                 result.updatedRecordings += batchResult.updatedCount;
                 result.errors.push(...batchResult.errors);
@@ -458,25 +947,49 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                     ...batchResult.newRecordingIds,
                 );
                 allNewRecordingNames.push(...batchResult.newRecordingNames);
+                importCandidates.push(...batchResult.importCandidates);
             }
 
-            // Early exit optimization: if we got fewer recordings than requested,
-            // or if we had no new/updated recordings for 2 pages, we're done
-            if (plaudRecordings.length < SYNC_CONFIG.PAGE_SIZE) {
+            // Once over the storage cap, every further new recording is a
+            // no-op; stop paginating to save Plaud API calls.
+            if (capState.blocked) {
+                hasMore = false;
+            } else if (plaudRecordings.length < SYNC_CONFIG.PAGE_SIZE) {
                 hasMore = false;
             } else if (
-                result.newRecordings === 0 &&
-                result.updatedRecordings === 0
+                pageNew === 0 &&
+                pageUpdated === 0 &&
+                pageCandidateCount === 0
             ) {
                 consecutiveEmptyPages++;
                 if (consecutiveEmptyPages >= 2) {
-                    hasMore = false;
+                    if (context.importPlaudContent) {
+                        if (
+                            !(await hasUnseenPlaudContentGaps(
+                                userId,
+                                seenRecordingIds,
+                            ))
+                        ) {
+                            hasMore = false;
+                        }
+                    } else if (
+                        result.newRecordings === 0 &&
+                        result.updatedRecordings === 0
+                    ) {
+                        hasMore = false;
+                    }
                 }
             } else {
                 consecutiveEmptyPages = 0;
             }
 
             page++;
+        }
+
+        if (capState.blocked) {
+            result.errors.push(
+                "Storage limit reached: some recordings were not synced. Upgrade or free up space to continue.",
+            );
         }
 
         // Update last sync time, plus the workspaceId if it was resolved or
@@ -503,6 +1016,9 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             .update(plaudConnections)
             .set({
                 lastSync: new Date(),
+                // A successful sync proves the token works again, so clear any
+                // prior invalidation (self-heals transient 401s).
+                invalidatedAt: null,
                 ...(workspaceIdChanged
                     ? { workspaceId: resolvedWorkspaceId }
                     : {}),
@@ -515,7 +1031,6 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                 ),
             );
 
-        // Send notifications
         if (
             context.emailNotifications &&
             context.notificationEmail &&
@@ -553,44 +1068,247 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             }
         }
 
-        // Queue transcription for new recordings (runs after sync response)
-        if (
-            context.autoTranscribe &&
-            result.pendingTranscriptionIds.length > 0
-        ) {
-            // Run transcription in background, don't await
-            queueTranscriptions(userId, result.pendingTranscriptionIds).catch(
-                (error) => {
-                    console.error("Background transcription failed:", error);
-                },
+        // Import Plaud-native transcript/summary content (#204) before
+        // deciding what to auto-transcribe. Runs after all recording rows are
+        // committed; never throws out of sync.
+        let plaudTranscriptImported = new Set<string>();
+        if (context.importPlaudContent && importCandidates.length > 0) {
+            plaudTranscriptImported = await importPlaudContent(
+                importCandidates,
+                context,
+                plaudClient,
+                result,
             );
+        }
+
+        // Auto-transcribe with the user's own provider. 'plaud_only' skips
+        // recordings that received a Plaud transcript (saves AI credits);
+        // 'keep_both' runs anyway so both coexist. Recordings whose Plaud
+        // transcript wasn't ready/failed fall back here naturally.
+        if (context.autoTranscribe) {
+            let retryIds: string[] = [];
+            try {
+                retryIds = await listAutoTranscribeRetryIds(userId, {
+                    transcriptMode: context.transcriptMode,
+                });
+            } catch (error) {
+                console.error("Auto-transcribe retry lookup failed:", error);
+            }
+            const mergedIds = [
+                ...new Set([...result.pendingTranscriptionIds, ...retryIds]),
+            ];
+            const eligibleIds =
+                context.transcriptMode === "keep_both"
+                    ? mergedIds
+                    : mergedIds.filter(
+                          (id) => !plaudTranscriptImported.has(id),
+                      );
+            const idsToTranscribe = claimAutoTranscribeIds(eligibleIds);
+
+            if (idsToTranscribe.length > 0) {
+                queueTranscriptions(userId, idsToTranscribe).catch((error) => {
+                    console.error("Background transcription failed:", error);
+                });
+            }
         }
 
         return result;
     } catch (error) {
         const errorMessage =
             error instanceof Error ? error.message : String(error);
+
+        // A 401 from Plaud means the stored token is no longer accepted
+        // (an expired user token with no working refresh token, a
+        // mistakenly-pasted 24h workspace token that has now died, or a
+        // revoked token). Mark the connection so the
+        // dashboard can prompt a reconnect instead of silently failing every
+        // sync. The row and synced recordings are preserved.
+        if (
+            error instanceof AppError &&
+            error.code === ErrorCode.PLAUD_INVALID_TOKEN
+        ) {
+            let replaced = false;
+            if (invalidationTarget) {
+                try {
+                    replaced =
+                        !(await markPlaudConnectionInvalidated(
+                            invalidationTarget,
+                        ));
+                } catch (stampError) {
+                    console.error(
+                        "Failed to mark Plaud connection as invalidated:",
+                        stampError,
+                    );
+                }
+            }
+            if (replaced) {
+                result.errors.push(
+                    "Your Plaud connection changed during this sync. Sync again to use it.",
+                );
+                return result;
+            }
+            result.needsReconnect = true;
+            result.errors.push(
+                "Plaud rejected the stored token. Reconnect your Plaud account.",
+            );
+            return result;
+        }
+
         result.errors.push(`Sync failed: ${errorMessage}`);
         return result;
     }
 }
 
-/**
- * Queue transcriptions to run in background
- * This is fire-and-forget to not block the sync response
- */
 async function queueTranscriptions(
     userId: string,
     recordingIds: string[],
 ): Promise<void> {
-    for (const recordingId of recordingIds) {
+    try {
+        for (const recordingId of recordingIds) {
+            try {
+                const outcome = await transcribeRecording(userId, recordingId, {
+                    trigger: "sync",
+                });
+                const stopped = noteAutoTranscribeOutcome(
+                    userId,
+                    recordingId,
+                    outcome.success,
+                    outcome.failureKind,
+                );
+                recordAutoTranscribeStatus(outcome);
+                if (stopped) {
+                    console.warn(
+                        `Auto-transcribe stopped for recording ${recordingId} (${outcome.failureKind}, status ${outcome.providerStatus ?? "none"}): ${(outcome.error ?? "unknown error").slice(0, 200)}. Use Re-transcribe to retry.`,
+                    );
+                }
+            } catch (error) {
+                noteAutoTranscribeOutcome(
+                    userId,
+                    recordingId,
+                    false,
+                    "transient",
+                );
+                recordAutoTranscribeStatus(null);
+                console.error(
+                    `Auto-transcription failed for recording ${recordingId}:`,
+                    error,
+                );
+            }
+        }
+    } finally {
+        releaseAutoTranscribeIds(recordingIds);
+    }
+}
+
+/**
+ * Import Plaud-native transcript/summary content for recordings Plaud has
+ * already processed. Runs AFTER recording rows are committed and BEFORE
+ * auto-transcribe, sequentially — gentle on the short-lived workspace token
+ * (#203). Non-destructive: only fills gaps, never overwrites an existing
+ * transcript/summary. Never throws out of sync; a dead token (401) stops the
+ * pass, any other failure skips that one item.
+ *
+ * Returns the set of recordingIds that now hold a Plaud transcript so the
+ * caller can decide (per `transcriptMode`) whether to also run the user's own
+ * provider.
+ */
+async function importPlaudContent(
+    candidates: ImportCandidate[],
+    context: SyncContext,
+    plaudClient: Awaited<ReturnType<typeof createPlaudClient>>,
+    result: SyncResult,
+): Promise<Set<string>> {
+    const transcriptImported = new Set<string>();
+    let tokenDead = false;
+
+    for (const candidate of candidates) {
+        if (tokenDead) break;
         try {
-            await transcribeRecording(userId, recordingId);
-        } catch (error) {
-            console.error(
-                `Auto-transcription failed for recording ${recordingId}:`,
-                error,
+            const gaps = await loadPlaudContentGaps(
+                context.userId,
+                candidate.recordingId,
+                {
+                    isTrans: candidate.isTrans,
+                    isSummary: candidate.isSummary,
+                },
             );
+            if (gaps.hasPlaudTranscript) {
+                transcriptImported.add(candidate.recordingId);
+            }
+            if (!gaps.needsTranscript && !gaps.needsSummary) continue;
+
+            const detail = await plaudClient.getFileDetail(
+                candidate.plaudFileId,
+            );
+            const { transcript, summary } = selectContentItems(detail);
+
+            // --- Transcript (coexists with the user's own; gap-fill only) ---
+            const transcriptLink = transcript?.data_link;
+            if (gaps.needsTranscript && isReady(transcript) && transcriptLink) {
+                const parsed = parseTranscript(
+                    await plaudClient.fetchContentLink(transcriptLink),
+                );
+                if (parsed.text.trim()) {
+                    const { committed } = await upsertTranscription({
+                        userId: context.userId,
+                        recordingId: candidate.recordingId,
+                        text: parsed.text,
+                        detectedLanguage: parsed.language,
+                        source: "plaud",
+                        provider: "plaud",
+                        model: "plaud-native",
+                    });
+                    if (committed) {
+                        transcriptImported.add(candidate.recordingId);
+                        await emitEvent(
+                            "transcription.completed",
+                            context.userId,
+                            candidate.recordingId,
+                        );
+                    }
+                }
+            }
+
+            // --- Summary (single per recording; gap-fill only) ---
+            const summaryLink = summary?.data_link;
+            if (gaps.needsSummary && isReady(summary) && summaryLink) {
+                // Prefer the inline copy (no S3 round-trip, no presign
+                // expiry, #203); fall back to the presigned link.
+                const inline = findInlineContent(detail, summary?.data_id);
+                const parsed = parseSummary(
+                    inline ?? (await plaudClient.fetchContentLink(summaryLink)),
+                );
+                if (parsed.summary.trim()) {
+                    await upsertEnhancement({
+                        userId: context.userId,
+                        recordingId: candidate.recordingId,
+                        summary: parsed.summary,
+                        keyPoints: parsed.keyPoints,
+                        actionItems: parsed.actionItems,
+                        source: "plaud",
+                        provider: "plaud",
+                        model: "plaud-native",
+                    });
+                }
+            }
+        } catch (error) {
+            if (
+                error instanceof AppError &&
+                error.code === ErrorCode.PLAUD_INVALID_TOKEN
+            ) {
+                // Workspace token died mid-pass (#203). Stop; audio already
+                // synced and auto-transcribe remains the fallback.
+                tokenDead = true;
+                result.errors.push(
+                    "Plaud content import stopped: access token expired",
+                );
+            } else {
+                result.errors.push(
+                    `Plaud content import failed for ${candidate.plaudFileId}: ${error}`,
+                );
+            }
         }
     }
+
+    return transcriptImported;
 }

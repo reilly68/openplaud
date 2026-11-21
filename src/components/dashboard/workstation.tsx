@@ -1,14 +1,17 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { CommandPalette } from "@/components/dashboard/command-palette";
+import { PlaudReconnectBanner } from "@/components/dashboard/plaud-reconnect-banner";
 import {
     RecordingList,
     type RecordingListHandle,
 } from "@/components/dashboard/recording-list";
 import { ShortcutsDialog } from "@/components/dashboard/shortcuts-dialog";
+import { TrialBanner } from "@/components/dashboard/trial-banner";
 import { WorkstationDetailPane } from "@/components/dashboard/workstation-detail-pane";
 import { WorkstationEmptyState } from "@/components/dashboard/workstation-empty-state";
 import { WorkstationHeader } from "@/components/dashboard/workstation-header";
@@ -16,6 +19,7 @@ import { OnboardingDialog } from "@/components/onboarding-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { useAutoSync } from "@/hooks/use-auto-sync";
 import { useListKeyboardNav } from "@/hooks/use-list-keyboard-nav";
+import { useProviderList } from "@/hooks/use-provider-list";
 import { useTheme } from "@/hooks/use-theme";
 import { useTranscribeQueue } from "@/hooks/use-transcribe-queue";
 import { useUploadQueue } from "@/hooks/use-upload-queue";
@@ -24,6 +28,10 @@ import {
     showNewRecordingNotification,
     showSyncCompleteNotification,
 } from "@/lib/notifications/browser";
+import {
+    applyFilenameOverrides,
+    reconcileFilenameOverrides,
+} from "@/lib/recordings/filename-overrides";
 import type { InitialSettings } from "@/lib/settings/initial-settings";
 import { SYNC_CONFIG } from "@/lib/sync-config";
 import { cn } from "@/lib/utils";
@@ -34,18 +42,6 @@ interface TranscriptionData {
     language?: string;
     transcriptionType?: string;
 }
-
-interface Provider {
-    id: string;
-    provider: string;
-    baseUrl: string | null;
-    defaultModel: string | null;
-    isDefaultTranscription: boolean;
-    isDefaultEnhancement: boolean;
-    createdAt: Date;
-}
-
-const EMPTY_PROVIDERS: Provider[] = [];
 
 interface WorkstationProps {
     recordings: Recording[];
@@ -65,7 +61,19 @@ interface WorkstationProps {
     userEmail?: string | null;
     initialSettings: InitialSettings;
     /**
-     * True when running in OpenPlaud's hosted mode (`IS_HOSTED=true`).
+     * True when Plaud has rejected the stored token (connection row carries
+     * an `invalidatedAt`). Seeds the reconnect banner on first paint; the
+     * live sync result takes over once a sync runs. Server-supplied.
+     */
+    plaudNeedsReconnect: boolean;
+    /**
+     * When the Plaud sign-in ends for good (ISO string), or null when
+     * unknown. Lets the reconnect banner warn before the connection ends.
+     * Server-supplied.
+     */
+    plaudSessionExpiresAt: string | null;
+    /**
+     * True when running in Riffado's hosted mode (`IS_HOSTED=true`).
      * Forwarded into SettingsDialog so hosted-only UI gating reflects
      * the deployment mode. Server-supplied; never derive client-side.
      * Required (no default) so a future caller can't silently regress
@@ -96,6 +104,8 @@ export function Workstation({
     isAdmin = false,
     userEmail = null,
     initialSettings,
+    plaudNeedsReconnect,
+    plaudSessionExpiresAt,
     isHosted,
 }: WorkstationProps) {
     const { refresh } = useRouter();
@@ -103,7 +113,13 @@ export function Workstation({
         recordings.length > 0 ? recordings[0] : null,
     );
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const [onboardingOpen, setOnboardingOpen] = useState(false);
+    // Auto-opens on first paint when the account hasn't finished
+    // onboarding yet (server-supplied truth, re-evaluated on every fresh
+    // navigation to this page). Everyone must finish onboarding --
+    // `mandatory` below keeps it non-dismissible in that case.
+    const [onboardingOpen, setOnboardingOpen] = useState(
+        () => !initialSettings.onboardingCompleted,
+    );
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [shortcutsOpen, setShortcutsOpen] = useState(false);
     const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
@@ -121,26 +137,43 @@ export function Workstation({
     const [transcriptionOverrides, setTranscriptionOverrides] = useState<
         Map<string, string>
     >(new Map());
+    const [filenameOverrides, setFilenameOverrides] = useState<
+        Map<string, string>
+    >(() => new Map());
     // On <lg viewports the list and detail panes can't coexist -- we
     // toggle between them instead of stacking. Desktop ignores this
     // state entirely (both panes render via the grid).
     const [mobileView, setMobileView] = useState<"list" | "detail">("list");
-    const [providers, setProviders] = useState<Provider[]>(EMPTY_PROVIDERS);
+    const {
+        providers,
+        loadFailed: providersLoadFailed,
+        prefetch: prefetchProviders,
+        replaceProviders,
+    } = useProviderList();
+
+    const openSettings = useCallback(() => {
+        prefetchProviders();
+        setSettingsOpen(true);
+    }, [prefetchProviders]);
 
     const { theme, setTheme } = useTheme(initialSettings.theme);
     const listRef = useRef<RecordingListHandle>(null);
 
     // Filter out optimistically-hidden (deleted) rows, then layer on any
-    // optimistic metadata edits so every consumer (list, detail pane,
-    // command palette) sees the edit before the server refetch lands.
+    // optimistic edits -- upstream inline renames plus the fork's metadata
+    // dialog (filename / startTime) -- so every consumer (list, detail
+    // pane, command palette) sees the edit before the server refetch lands.
     const visibleRecordings = useMemo(() => {
-        const base = recordings.filter((r) => !hiddenIds.has(r.id));
+        const base = applyFilenameOverrides(
+            recordings.filter((r) => !hiddenIds.has(r.id)),
+            filenameOverrides,
+        );
         if (editedOverrides.size === 0) return base;
         return base.map((r) => {
             const patch = editedOverrides.get(r.id);
             return patch ? { ...r, ...patch } : r;
         });
-    }, [recordings, hiddenIds, editedOverrides]);
+    }, [recordings, hiddenIds, filenameOverrides, editedOverrides]);
 
     // Layer optimistic transcript edits over the server-provided Map so
     // every consumer (detail pane, list search, command palette) sees a
@@ -162,6 +195,11 @@ export function Workstation({
     const currentTranscription = currentRecording
         ? effectiveTranscriptions.get(currentRecording.id)
         : undefined;
+
+    const selectedRecording = currentRecording
+        ? (visibleRecordings.find((r) => r.id === currentRecording.id) ??
+          currentRecording)
+        : null;
 
     // Keep currentRecording in sync with the recordings prop (updated
     // after refresh()). If the previously-selected recording is no
@@ -202,6 +240,9 @@ export function Workstation({
             }
             return next.size === prev.size ? prev : next;
         });
+        setFilenameOverrides((prev) =>
+            reconcileFilenameOverrides(recordings, prev),
+        );
     }, [recordings]);
 
     // Drop optimistic transcript overrides once the refreshed server Map
@@ -261,17 +302,34 @@ export function Workstation({
         await manualSync();
     }, [manualSync]);
 
-    // Settings dialog needs the provider list at open-time so the
-    // Providers section seeds correctly. Fetching on open (rather
-    // than on mount) avoids loading a list the user may never see.
+    // Prefer the live sync result once we have one; fall back to the
+    // server-rendered flag on first paint (before any sync runs). A
+    // change in `plaudNeedsReconnect` only happens when fresh server
+    // truth arrives (e.g. a `router.refresh()` after another tab's sync
+    // invalidated the token), so it always resets the override rather
+    // than letting a stale client-side result keep masking it.
+    const [reconnectOverride, setReconnectOverride] = useState<boolean | null>(
+        null,
+    );
+    const prevPlaudNeedsReconnect = useRef(plaudNeedsReconnect);
     useEffect(() => {
-        if (settingsOpen) {
-            fetch("/api/settings/ai/providers")
-                .then((res) => res.json())
-                .then((data) => setProviders(data.providers || []))
-                .catch(() => setProviders([]));
+        if (plaudNeedsReconnect !== prevPlaudNeedsReconnect.current) {
+            prevPlaudNeedsReconnect.current = plaudNeedsReconnect;
+            setReconnectOverride(null);
         }
-    }, [settingsOpen]);
+    }, [plaudNeedsReconnect]);
+    useEffect(() => {
+        if (typeof lastSyncResult?.needsReconnect === "boolean") {
+            setReconnectOverride(lastSyncResult.needsReconnect);
+        }
+    }, [lastSyncResult]);
+    const showReconnect = reconnectOverride ?? plaudNeedsReconnect;
+
+    const handleReconnected = useCallback(() => {
+        setReconnectOverride(false);
+        refresh();
+        manualSync();
+    }, [refresh, manualSync]);
 
     const {
         isUploading,
@@ -322,6 +380,9 @@ export function Workstation({
                     method: "DELETE",
                 });
                 if (!res.ok) throw new Error("Delete failed");
+                if (posthog.__loaded) {
+                    posthog.capture("recording_deleted");
+                }
                 toast.success("Recording deleted");
                 refresh();
             } catch (err) {
@@ -375,6 +436,16 @@ export function Workstation({
         [refresh],
     );
 
+    const handleRenamed = useCallback(
+        (filename: string) => {
+            const id = currentRecording?.id;
+            if (!id) return;
+            setFilenameOverrides((prev) => new Map(prev).set(id, filename));
+            refresh();
+        },
+        [currentRecording?.id, refresh],
+    );
+
     // Keyboard shortcuts (global). Disabled while any modal is open
     // so the modal owns keyboard focus exclusively. The shortcuts
     // dialog itself uses these very keys to navigate its rows.
@@ -384,7 +455,7 @@ export function Workstation({
         onFocusSearch: () => listRef.current?.focusSearch(),
         onOpenPalette: () => setPaletteOpen(true),
         onOpenShortcuts: () => setShortcutsOpen(true),
-        onOpenSettings: () => setSettingsOpen(true),
+        onOpenSettings: openSettings,
         enabled:
             !settingsOpen && !onboardingOpen && !paletteOpen && !shortcutsOpen,
     });
@@ -393,6 +464,7 @@ export function Workstation({
         <>
             <div className="bg-background">
                 <div className="container mx-auto max-w-7xl px-4 py-6">
+                    <TrialBanner isHosted={isHosted} />
                     <WorkstationHeader
                         isAdmin={isAdmin}
                         userEmail={userEmail}
@@ -408,8 +480,15 @@ export function Workstation({
                         onTriggerUpload={triggerUpload}
                         onUploadInputChange={handleUpload}
                         onOpenPalette={() => setPaletteOpen(true)}
-                        onOpenSettings={() => setSettingsOpen(true)}
+                        onOpenSettings={openSettings}
+                        onSettingsIntent={prefetchProviders}
                         onOpenShortcuts={() => setShortcutsOpen(true)}
+                    />
+
+                    <PlaudReconnectBanner
+                        show={showReconnect}
+                        sessionExpiresAt={plaudSessionExpiresAt}
+                        onReconnected={handleReconnected}
                     />
 
                     {visibleRecordings.length === 0 &&
@@ -467,13 +546,15 @@ export function Workstation({
                             </div>
 
                             <WorkstationDetailPane
-                                currentRecording={currentRecording}
+                                currentRecording={selectedRecording}
                                 currentTranscription={currentTranscription}
                                 isCurrentTranscribing={isCurrentTranscribing}
                                 visibleRecordings={visibleRecordings}
                                 onTranscribe={handleTranscribe}
                                 onTranscriptSaved={handleTranscriptSaved}
+                                onTranscribeComplete={refresh}
                                 onSelectRecording={setCurrentRecording}
+                                onRenamed={handleRenamed}
                                 onBackToList={() => setMobileView("list")}
                                 hiddenOnMobile={mobileView === "list"}
                                 initialPlaybackSpeed={
@@ -505,7 +586,7 @@ export function Workstation({
                 }}
                 onSync={handleSync}
                 onUpload={triggerUpload}
-                onOpenSettings={() => setSettingsOpen(true)}
+                onOpenSettings={openSettings}
                 onOpenShortcuts={() => setShortcutsOpen(true)}
                 onSetTheme={setTheme}
                 onTranscribeRecording={transcribeById}
@@ -519,12 +600,16 @@ export function Workstation({
             <SettingsDialog
                 open={settingsOpen}
                 onOpenChange={setSettingsOpen}
-                initialProviders={providers}
+                providers={providers}
+                onProvidersChange={replaceProviders}
+                providersLoadFailed={providersLoadFailed}
+                onRetryProviders={prefetchProviders}
                 isHosted={isHosted}
                 onReRunOnboarding={() => {
                     setSettingsOpen(false);
                     setOnboardingOpen(true);
                 }}
+                onPlaudReconnected={handleReconnected}
             />
 
             <OnboardingDialog
@@ -534,6 +619,7 @@ export function Workstation({
                     setOnboardingOpen(false);
                     refresh();
                 }}
+                mandatory={!initialSettings.onboardingCompleted}
             />
         </>
     );

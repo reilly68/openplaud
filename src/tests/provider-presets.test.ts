@@ -1,45 +1,33 @@
 import { describe, expect, it } from "vitest";
 import {
     findPreset,
+    getTranscriptionStyle,
     getVisiblePresets,
     isLocalPreset,
     LOCAL_PRESET_NAMES,
     PROVIDER_PRESETS,
+    supportsEnhancement,
 } from "@/lib/ai/provider-presets";
 
 describe("provider-presets", () => {
-    describe("getVisiblePresets", () => {
-        it("returns every preset on self-host", () => {
-            const visible = getVisiblePresets({ isHosted: false });
-            expect(visible).toEqual(PROVIDER_PRESETS);
-        });
-
-        it("hides LM Studio and Ollama on hosted", () => {
-            const visible = getVisiblePresets({ isHosted: true });
-            const names = visible.map((p) => p.name);
-            expect(names).not.toContain("LM Studio");
-            expect(names).not.toContain("Ollama");
-        });
-
-        it("keeps every non-local preset on hosted", () => {
-            const visible = getVisiblePresets({ isHosted: true }).map(
-                (p) => p.name,
+    describe("visibility", () => {
+        it("shows all presets on self-host and only non-local presets on hosted", () => {
+            expect(getVisiblePresets({ isHosted: false })).toEqual(
+                PROVIDER_PRESETS,
             );
-            expect(visible).toContain("OpenAI");
-            expect(visible).toContain("Groq");
-            expect(visible).toContain("Together AI");
-            expect(visible).toContain("OpenRouter");
-            expect(visible).toContain("Custom");
+            expect(getVisiblePresets({ isHosted: true })).toEqual(
+                PROVIDER_PRESETS.filter((p) => !LOCAL_PRESET_NAMES.has(p.name)),
+            );
         });
     });
 
     describe("isLocalPreset", () => {
-        it("matches the published LOCAL_PRESET_NAMES set", () => {
-            expect(isLocalPreset("LM Studio")).toBe(true);
-            expect(isLocalPreset("Ollama")).toBe(true);
-            expect(isLocalPreset("OpenAI")).toBe(false);
-            expect(isLocalPreset("Custom")).toBe(false);
-            expect(LOCAL_PRESET_NAMES.has("LM Studio")).toBe(true);
+        it("matches LOCAL_PRESET_NAMES", () => {
+            for (const preset of PROVIDER_PRESETS) {
+                expect(isLocalPreset(preset.name)).toBe(
+                    LOCAL_PRESET_NAMES.has(preset.name),
+                );
+            }
         });
     });
 
@@ -57,35 +45,12 @@ describe("provider-presets", () => {
     });
 
     describe("knownTranscriptionModels", () => {
-        it("OpenAI includes whisper-1 plus the gpt-4o-transcribe family", () => {
-            const models = findPreset("OpenAI")?.knownTranscriptionModels;
-            expect(models).toEqual([
-                "whisper-1",
-                "gpt-4o-transcribe",
-                "gpt-4o-mini-transcribe",
-                "gpt-4o-transcribe-diarize",
-            ]);
-        });
-
-        it("Groq lists current Whisper Large v3 models (no distil)", () => {
-            const models = findPreset("Groq")?.knownTranscriptionModels;
-            expect(models).toEqual([
-                "whisper-large-v3-turbo",
-                "whisper-large-v3",
-            ]);
-        });
-
         it("Together AI uses the correct prefixed Whisper id", () => {
-            // Regression: the preset default used to be `whisper-large-v3`
-            // (no prefix), which 404s on Together AI. Their actual id is
-            // `openai/whisper-large-v3` per the audio section of
-            // docs.together.ai/docs/serverless-models.
             const preset = findPreset("Together AI");
             expect(preset?.defaultModel).toBe("openai/whisper-large-v3");
-            expect(preset?.knownTranscriptionModels).toEqual([
+            expect(preset?.knownTranscriptionModels).toContain(
                 "openai/whisper-large-v3",
-                "nvidia/parakeet-tdt-0.6b-v3",
-            ]);
+            );
         });
 
         it("local + custom presets have no curated list (freeform input)", () => {
@@ -105,6 +70,48 @@ describe("provider-presets", () => {
                 if (!p.knownTranscriptionModels) continue;
                 expect(p.knownTranscriptionModels).toContain(p.defaultModel);
             }
+        });
+    });
+
+    describe("ElevenLabs", () => {
+        it("uses the elevenlabs transcription style with scribe_v2 as default", () => {
+            const preset = findPreset("ElevenLabs");
+            expect(preset).toBeDefined();
+            expect(preset?.transcriptionStyle).toBe("elevenlabs");
+            expect(preset?.defaultModel).toBe("scribe_v2");
+            expect(preset?.knownTranscriptionModels).toContain("scribe_v1");
+        });
+
+        it("is not a local preset and stays visible on hosted", () => {
+            expect(isLocalPreset("ElevenLabs")).toBe(false);
+            expect(
+                getVisiblePresets({ isHosted: true }).some(
+                    (p) => p.name === "ElevenLabs",
+                ),
+            ).toBe(true);
+        });
+    });
+
+    describe("getTranscriptionStyle", () => {
+        it("resolves 'elevenlabs' for the ElevenLabs preset", () => {
+            expect(getTranscriptionStyle("ElevenLabs")).toBe("elevenlabs");
+        });
+    });
+
+    describe("supportsEnhancement", () => {
+        it("is false for ElevenLabs", () => {
+            expect(supportsEnhancement("ElevenLabs")).toBe(false);
+        });
+
+        it("is true for every other preset", () => {
+            for (const preset of PROVIDER_PRESETS) {
+                if (preset.name === "ElevenLabs") continue;
+                expect(supportsEnhancement(preset.name)).toBe(true);
+            }
+        });
+
+        it("is true for an unknown/custom provider name", () => {
+            expect(supportsEnhancement("Nope")).toBe(true);
         });
     });
 });

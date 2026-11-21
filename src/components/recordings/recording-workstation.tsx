@@ -2,11 +2,16 @@
 
 import { ArrowLeft, Loader2, Trash2 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { RecordingPlayer } from "@/components/dashboard/recording-player";
-import { TranscriptionPanel } from "@/components/dashboard/transcription-panel";
+import {
+    TranscriptionPanel,
+    type TranscriptOption,
+} from "@/components/dashboard/transcription-panel";
 import { LocalTime } from "@/components/local-time";
+import { DownloadAudioButton } from "@/components/recordings/download-audio-button";
+import { RecordingTitle } from "@/components/recordings/recording-title";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -28,6 +33,8 @@ interface Transcription {
 interface RecordingWorkstationProps {
     recording: Recording;
     transcription?: Transcription;
+    /** All transcripts (one per source) for the in-panel source switcher. */
+    transcripts?: TranscriptOption[];
     /**
      * User playback preferences forwarded into the embedded
      * RecordingPlayer. Server-resolved (with the same defaults as the
@@ -44,6 +51,7 @@ interface RecordingWorkstationProps {
 export function RecordingWorkstation({
     recording,
     transcription,
+    transcripts,
     initialPlaybackSpeed,
     initialVolume,
     initialAutoPlayNext,
@@ -53,6 +61,27 @@ export function RecordingWorkstation({
     const [isTranscribing, setIsTranscribing] = useState(false);
     const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
+    const [filename, setFilename] = useState(recording.filename);
+
+    useEffect(() => {
+        setFilename(recording.filename);
+    }, [recording.filename]);
+
+    const displayRecording = useMemo(
+        () =>
+            filename === recording.filename
+                ? recording
+                : { ...recording, filename },
+        [recording, filename],
+    );
+
+    const handleRenamed = useCallback(
+        (next: string) => {
+            setFilename(next);
+            refresh();
+        },
+        [refresh],
+    );
 
     const handleTranscribe = useCallback(async () => {
         setIsTranscribing(true);
@@ -114,13 +143,19 @@ export function RecordingWorkstation({
                         <ArrowLeft className="size-4" />
                     </Button>
                     <div className="flex-1 min-w-0">
-                        <h1 className="text-3xl font-semibold truncate">
-                            {recording.filename}
+                        <h1 className="min-w-0">
+                            <RecordingTitle
+                                recordingId={recording.id}
+                                filename={filename}
+                                onRenamed={handleRenamed}
+                                className="text-3xl font-semibold"
+                            />
                         </h1>
                         <p className="text-muted-foreground text-sm mt-1">
                             <LocalTime value={recording.startTime} />
                         </p>
                     </div>
+                    <DownloadAudioButton recordingId={recording.id} />
                     <Button
                         onClick={() => setDeleteDialogOpen(true)}
                         variant="outline"
@@ -135,18 +170,21 @@ export function RecordingWorkstation({
                 {/* Content */}
                 <div className="space-y-6">
                     <RecordingPlayer
-                        recording={recording}
+                        recording={displayRecording}
                         initialPlaybackSpeed={initialPlaybackSpeed}
                         initialVolume={initialVolume}
                         initialAutoPlayNext={initialAutoPlayNext}
                         scrubberStyle={scrubberStyle}
+                        onRenamed={handleRenamed}
                     />
                     <TranscriptionPanel
-                        recording={recording}
+                        recording={displayRecording}
                         transcription={transcription}
+                        transcripts={transcripts}
                         isTranscribing={isTranscribing}
                         onTranscribe={handleTranscribe}
                         onTranscriptSaved={() => refresh()}
+                        onTranscribeComplete={refresh}
                     />
 
                     {/* Metadata */}
@@ -216,9 +254,9 @@ export function RecordingWorkstation({
                         <DialogTitle>Delete this recording?</DialogTitle>
                         <DialogDescription>
                             This permanently removes the audio file,
-                            transcription, and AI summary from OpenPlaud. The
+                            transcription, and AI summary from Riffado. The
                             recording on your Plaud account is not affected, but
-                            it will not be re-synced to OpenPlaud.
+                            it will not be re-synced to Riffado.
                         </DialogDescription>
                     </DialogHeader>
                     <DialogFooter>

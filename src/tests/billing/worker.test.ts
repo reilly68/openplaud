@@ -1,0 +1,199 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const {
+    cycleCloseMock,
+    lapseMock,
+    deletionMock,
+    remindersMock,
+    transitionMock,
+    foundingReservationsMock,
+    reconcileMock,
+    webhookInboxMock,
+} = vi.hoisted(() => ({
+    cycleCloseMock: { closeDueCycles: vi.fn() },
+    lapseMock: { processExpiredTrials: vi.fn() },
+    deletionMock: { processDueAccountDeletions: vi.fn() },
+    remindersMock: { processGraceReminders: vi.fn() },
+    transitionMock: { processTransitionEmails: vi.fn() },
+    foundingReservationsMock: { reconcileExpiredFoundingReservations: vi.fn() },
+    reconcileMock: { reconcileStaleSubscriptions: vi.fn() },
+    webhookInboxMock: { processStripeWebhookInbox: vi.fn() },
+}));
+
+vi.mock("@/lib/hosted/billing/cycle-close", () => cycleCloseMock);
+vi.mock("@/lib/hosted/billing/lapse", () => lapseMock);
+vi.mock("@/lib/hosted/billing/deletion", () => deletionMock);
+vi.mock("@/lib/hosted/billing/grace-reminders", () => remindersMock);
+vi.mock("@/lib/hosted/billing/transition-emails", () => transitionMock);
+vi.mock(
+    "@/lib/hosted/billing/founding-reservations",
+    () => foundingReservationsMock,
+);
+vi.mock("@/lib/hosted/billing/reconcile", () => reconcileMock);
+vi.mock("@/lib/hosted/billing/webhook-inbox", () => webhookInboxMock);
+vi.mock("@/lib/env", () => ({
+    env: { IS_HOSTED: true, BILLING_ENABLED: true },
+}));
+
+import { tick } from "@/lib/hosted/billing/worker";
+import {
+    drainPending,
+    resetStatusRecorderForTests,
+    setStatusRecordingEnabled,
+} from "@/lib/status/record";
+
+function zeroResults() {
+    cycleCloseMock.closeDueCycles.mockResolvedValue(0);
+    lapseMock.processExpiredTrials.mockResolvedValue({
+        lapsed: 0,
+        errors: 0,
+    });
+    deletionMock.processDueAccountDeletions.mockResolvedValue({
+        deleted: 0,
+        storagePartial: 0,
+        errors: 0,
+    });
+    remindersMock.processGraceReminders.mockResolvedValue({
+        reminders: 0,
+        lastDay: 0,
+        errors: 0,
+    });
+    transitionMock.processTransitionEmails.mockResolvedValue({
+        start: 0,
+        reminder: 0,
+        ended: 0,
+        errors: 0,
+    });
+    foundingReservationsMock.reconcileExpiredFoundingReservations.mockResolvedValue(
+        {
+            inspected: 0,
+            expired: 0,
+            completed: 0,
+            errors: 0,
+        },
+    );
+    reconcileMock.reconcileStaleSubscriptions.mockResolvedValue({
+        inspected: 0,
+        errors: 0,
+    });
+    webhookInboxMock.processStripeWebhookInbox.mockResolvedValue({
+        claimed: 0,
+        completed: 0,
+        retried: 0,
+        failed: 0,
+    });
+}
+
+describe("billing worker tick", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        zeroResults();
+    });
+
+    it("still runs the later phases when an earlier phase's top-level query throws", async () => {
+        cycleCloseMock.closeDueCycles.mockRejectedValue(
+            new Error("db connection lost"),
+        );
+        const errorSpy = vi
+            .spyOn(console, "error")
+            .mockImplementation(() => {});
+
+        await tick();
+        errorSpy.mockRestore();
+
+        expect(lapseMock.processExpiredTrials).toHaveBeenCalled();
+        expect(deletionMock.processDueAccountDeletions).toHaveBeenCalled();
+        expect(remindersMock.processGraceReminders).toHaveBeenCalled();
+        expect(transitionMock.processTransitionEmails).toHaveBeenCalledWith({
+            sendStart: false,
+        });
+        expect(
+            foundingReservationsMock.reconcileExpiredFoundingReservations,
+        ).toHaveBeenCalled();
+    });
+
+    it("reconciles expired founding reservations before deriving transition email pricing", async () => {
+        await tick();
+
+        expect(
+            foundingReservationsMock.reconcileExpiredFoundingReservations.mock
+                .invocationCallOrder[0],
+        ).toBeLessThan(
+            transitionMock.processTransitionEmails.mock.invocationCallOrder[0],
+        );
+    });
+
+    it("a middle phase throwing does not block the later phases either", async () => {
+        deletionMock.processDueAccountDeletions.mockRejectedValue(
+            new Error("storage provider down"),
+        );
+        const errorSpy = vi
+            .spyOn(console, "error")
+            .mockImplementation(() => {});
+
+        await tick();
+        errorSpy.mockRestore();
+
+        expect(cycleCloseMock.closeDueCycles).toHaveBeenCalled();
+        expect(lapseMock.processExpiredTrials).toHaveBeenCalled();
+        expect(remindersMock.processGraceReminders).toHaveBeenCalled();
+        expect(transitionMock.processTransitionEmails).toHaveBeenCalledWith({
+            sendStart: false,
+        });
+        expect(
+            foundingReservationsMock.reconcileExpiredFoundingReservations,
+        ).toHaveBeenCalled();
+    });
+
+    describe("billing-lapse status job", () => {
+        beforeEach(() => {
+            resetStatusRecorderForTests();
+            setStatusRecordingEnabled(true);
+        });
+
+        function lapseRun() {
+            return drainPending().jobs.find(
+                (job) => job.job === "billing-lapse",
+            );
+        }
+
+        it("records a failure when trial-lapse had any per-user error", async () => {
+            const logSpy = vi
+                .spyOn(console, "log")
+                .mockImplementation(() => {});
+            for (const lapse of [
+                { lapsed: 0, errors: 2 },
+                { lapsed: 1, errors: 1 },
+            ]) {
+                lapseMock.processExpiredTrials.mockResolvedValue(lapse);
+                await tick();
+                expect(lapseRun()).toMatchObject({
+                    lastSuccessAt: null,
+                    lastErrorAt: expect.any(Date),
+                });
+            }
+            logSpy.mockRestore();
+        });
+
+        it("records a success when trial-lapse made progress or had nothing to do", async () => {
+            await tick();
+            expect(lapseRun()).toMatchObject({
+                lastSuccessAt: expect.any(Date),
+                lastErrorAt: null,
+            });
+            lapseMock.processExpiredTrials.mockResolvedValue({
+                lapsed: 1,
+                errors: 0,
+            });
+            const logSpy = vi
+                .spyOn(console, "log")
+                .mockImplementation(() => {});
+            await tick();
+            logSpy.mockRestore();
+            expect(lapseRun()).toMatchObject({
+                lastSuccessAt: expect.any(Date),
+                lastErrorAt: null,
+            });
+        });
+    });
+});

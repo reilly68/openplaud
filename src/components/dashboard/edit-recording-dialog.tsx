@@ -83,13 +83,14 @@ export function EditRecordingDialog({
             }
 
             const data = (await response.json()) as {
-                recording: Recording;
+                filename: string;
+                startTime?: string;
             };
             toast.success("Recording updated");
             onSaved({
-                id: data.recording.id,
-                filename: data.recording.filename,
-                startTime: data.recording.startTime,
+                id: recording.id,
+                filename: data.filename,
+                startTime: data.startTime ?? recording.startTime,
             });
             onOpenChange(false);
         } catch (err) {
