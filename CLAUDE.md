@@ -70,6 +70,7 @@ until curl -sf -o /dev/null http://127.0.0.1:3010/; do sleep 3; done
 - Náš -302 region auto-heal je vrstvený nad v4 klientem (`followRegionRedirect` v `request()`, kterým jdou i v4 volání).
 - **Forkový `autoprocess.ts` ZRUŠEN (2026-11-21).** v0.7.0 umí vše samo: `[background-sync]` worker (5 min) → auto-transcribe (`user_settings.auto_transcribe`, retry až 6×) → generování titulku (`auto_generate_title`) → auto-summary (`auto_summarize`). Autoprocess běžel souběžně a posílal na pascal druhý přepis naráz → MLX/Metal crash whisper serveru (`EXC_BREAKPOINT` v libmlx) a chyby `Failed to parse JSON`. **Pascal whisper nesnese paralelní požadavky – nikdy nepřidávat druhý přepisovací pipeline.**
 - Sync route vrací `success:true` i při chybě – chyby jsou v `errors[]`; kontroluj je, ne jen `newRecordings`.
+- **NaN v odpovědi pascalu:** `server.py` dělá `json.dumps` s `allow_nan=True` → `"avg_logprob": NaN` u segmentů s teplotním fallbackem → „Failed to parse JSON“ a nahrávka se nikdy nepřepíše. Fork to obchází v `src/lib/transcription/openai-client.ts` (`sanitizeNonFiniteJson`, líná Proxy na `json()`), test `transcription-nan-json.test.ts`. Čistá oprava patří na pascal.
 - `sync_title_to_plaud=false` (2026-11-21, přání uživatele): titulky jen lokálně, do Plaudu se nepíše.
 
 ## Lokální ověření (funguje)
