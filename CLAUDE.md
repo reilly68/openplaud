@@ -7,7 +7,8 @@ upstream **`AGENTS.md`** v rootu. Tento soubor dokumentuje jen to, co je
 
 ## Co to je
 
-- Fork upstreamu `openplaud/openplaud`. Remotes: `origin` = reilly68 (náš), `upstream` = openplaud.
+- Fork upstreamu `riffado/riffado` (dřív `openplaud/openplaud`, přejmenováno). Remotes: `origin` = reilly68 (náš), `upstream` = riffado.
+- Base: **riffado v0.7.0** (merge 2026-11-21, větev `merge/v0.7.0`). Další upgrady mergovat po tagech (`git merge vX.Y.Z`).
 - Běží na `main`, **desítky commitů před upstreamem** (fork-specific featury + fixy).
 - Image: `ghcr.io/reilly68/openplaud:dev` (NE `:latest`). Build přes GitHub Actions (Docker workflow) na push do `main`.
 - Workflow s upstreamem: `git fetch upstream && git merge upstream/main` → řešit konflikty → push. Nikdy nepushujeme fork→upstream (jen merge upstream→fork).
@@ -55,11 +56,25 @@ until curl -sf -o /dev/null http://127.0.0.1:3010/; do sleep 3; done
 - **Šifrování at-rest:** `filename`, `transcriptions.text`, summary jsou šifrované (`encryptText`/`decryptText` z `src/lib/encryption/fields.ts`, formát `v1:iv:tag:ct`). DB drží ciphertext, API vrací plaintext. Při novém endpointu na content poli VŽDY encrypt/decrypt.
 - **API route vzor:** `apiHandler` + `requireApiSession`; WHERE scopovat `eq(userId)` + `isNull(deletedAt)`. Vzor: `src/app/api/settings/webhooks/[id]/route.ts`.
 - **`TranscriptionPanel` má DVA konzumenty** — `dashboard/workstation-detail-pane.tsx` A `recordings/recording-workstation.tsx`. Nový povinný prop musí dostat oba. **CI „Type Check" job to NEZACHYTÍ — chytne až `next build`.** Vždy `grep -rln "<TranscriptionPanel"`.
-- **Biome** je striktní na formát i lint (`Number.isNaN`, line width, import sort). Lokálně na mernas Biome binary segfaultuje (arm stub) a `node_modules` je nekompletní → **lokální lint/typecheck/build NEJDE**, spoléhej na CI a iteruj. Bun na mernas není.
+- **Biome** je striktní na formát i lint (`Number.isNaN`, line width, import sort). Lokálně na mernas Biome binary segfaultuje (arm stub) a `node_modules` je nekompletní → **lokální lint/typecheck/build NEJDE**, spoléhej na CI a iteruj. Bun na mernas není. **Ale:** viz „Lokální ověření“ níže – v kontejneru node:22 vše funguje.
 - **OMV přepisuje** `/etc/docker/daemon.json` a compose soubory při aplikaci konfigurace — neměň je ručně bez vědomí, že je OMV může přegenerovat.
 - Auto-summary po editaci transkriptu je **client-side** (panel `onSaved` → `handleSummarize`), ne v PATCH endpointu.
 
 ## Další kontext
 
 - Detailní historie změn a lessons v paměti Claude Code: `project_openplaud_update.md`.
+
+## Plaud 4.0 (2026-11)
+- Plaud převedl účet na backend „4.0“: legacy `/file/...` vrací HTTP 200 `{"status":-1800907}`. Sync od 2026-11-11 tiše importoval 0 (route vrací `success:true` + `errors[]`).
+- Řeší upstream v0.7.0 (`src/lib/plaud/v4.ts`, PR #328/#357): `PlaudClient` přepne na `/file-app/v4/...`, staré nahrávky mapuje `of_<legacy id>` → bez duplikátů.
+- Náš -302 region auto-heal je vrstvený nad v4 klientem (`followRegionRedirect` v `request()`, kterým jdou i v4 volání).
+- `autoprocess.ts` nově loguje `[autoprocess] Sync error: …` z `errors[]` – „Sync: 0 new“ bez chyby je teď opravdu 0.
+
+## Lokální ověření (funguje)
+Na mernas lze typecheck/lint/testy pustit v kontejneru (node_modules v docker volume, repo se nezanáší):
+```bash
+docker run --rm -v "$PWD":/app -v openplaud-nm:/app/node_modules -w /app -e CI=1 node:22.20.0-bookworm-slim \
+  sh -c 'corepack enable && corepack prepare pnpm@11.7.0 --activate && pnpm install --frozen-lockfile --ignore-scripts && pnpm type-check && pnpm format-and-lint && pnpm test'
+```
+⚠️ **Nativní `docker build .` na Pi NEDĚLAT** – 2026-11-21 během něj mernas tvrdě spadl (reboot, poškozený journal). Image stavět jen přes GitHub Actions.
 - Upstream konvence: `AGENTS.md`.
