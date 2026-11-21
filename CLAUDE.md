@@ -48,7 +48,7 @@ until curl -sf -o /dev/null http://127.0.0.1:3010/; do sleep 3; done
 - **Edit transkriptu** — `PATCH /api/recordings/[id]/transcript` (`text`, šifruje, `transcriptionType="manual"`, FOR UPDATE lock); dialog `edit-transcription-dialog.tsx`; auto-regenerace summary po uložení; Whisper Re-transcribe varuje když je transkript ručně editovaný.
 - **Cleanup-artifact strip** — `stripCleanupArtifacts()` v `src/lib/transcription/format.ts`, v `parseTranscriptionResponse` (choke point). Odstavcový, NE `***`-bridging. Test `src/tests/regressions/cleanup-artifact-strip.test.ts`.
 - **generate-title** — `POST /api/recordings/[id]/generate-title` (české titulky, max_tokens 8000 pro qwen thinking).
-- **Compose override** HOSTNAME=0.0.0.0 (jinak Next.js bindoval container IP → ECONNREFUSED), Bun.sql global v autoprocess, RIFF magic-byte contentType fix.
+- **Compose override** HOSTNAME=0.0.0.0 (od v0.7.0 default v image, override neškodí). RIFF detekci a timeouty přepisu od v0.7.0 řeší upstream.
 - **Plaud region auto-heal** — `PlaudClient` následuje business `-302` („region switch required" / „user region mismatch") na libovolném endpointu: validuje `data.domains.api` proti plaud.ai allowlistu, resetuje WT stav, retryne na nové bázi (guard `MAX_REGION_REDIRECTS`); `client.currentApiBase` persistuje sync i transcribe path do `plaud_connections.api_base`. Motivace: Plaud 2026-06 přesunul účet global→EU a sync 9 dní tiše hlásil „0 new recordings". Test `src/tests/regressions/region-switch-autoheal.test.ts`.
 
 ## Konvence a záludnosti
@@ -68,7 +68,9 @@ until curl -sf -o /dev/null http://127.0.0.1:3010/; do sleep 3; done
 - Plaud převedl účet na backend „4.0“: legacy `/file/...` vrací HTTP 200 `{"status":-1800907}`. Sync od 2026-11-11 tiše importoval 0 (route vrací `success:true` + `errors[]`).
 - Řeší upstream v0.7.0 (`src/lib/plaud/v4.ts`, PR #328/#357): `PlaudClient` přepne na `/file-app/v4/...`, staré nahrávky mapuje `of_<legacy id>` → bez duplikátů.
 - Náš -302 region auto-heal je vrstvený nad v4 klientem (`followRegionRedirect` v `request()`, kterým jdou i v4 volání).
-- `autoprocess.ts` nově loguje `[autoprocess] Sync error: …` z `errors[]` – „Sync: 0 new“ bez chyby je teď opravdu 0.
+- **Forkový `autoprocess.ts` ZRUŠEN (2026-11-21).** v0.7.0 umí vše samo: `[background-sync]` worker (5 min) → auto-transcribe (`user_settings.auto_transcribe`, retry až 6×) → generování titulku (`auto_generate_title`) → auto-summary (`auto_summarize`). Autoprocess běžel souběžně a posílal na pascal druhý přepis naráz → MLX/Metal crash whisper serveru (`EXC_BREAKPOINT` v libmlx) a chyby `Failed to parse JSON`. **Pascal whisper nesnese paralelní požadavky – nikdy nepřidávat druhý přepisovací pipeline.**
+- Sync route vrací `success:true` i při chybě – chyby jsou v `errors[]`; kontroluj je, ne jen `newRecordings`.
+- `sync_title_to_plaud=false` (2026-11-21, přání uživatele): titulky jen lokálně, do Plaudu se nepíše.
 
 ## Lokální ověření (funguje)
 Na mernas lze typecheck/lint/testy pustit v kontejneru (node_modules v docker volume, repo se nezanáší):
