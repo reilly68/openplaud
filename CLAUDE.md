@@ -18,7 +18,7 @@ upstream **`AGENTS.md`** v rootu. Tento soubor dokumentuje jen to, co je
 - Kontejnery: `openplaud` (app, port 3010→3000) + `openplaud-db` (postgres:16).
 - Compose soubory (root-owned, OMV-generované): `BASE=/srv/dev-disk-by-uuid-6f606104-f83e-48dd-8f60-b4a449dede4c/usbdisk_/openplaud/` → `openplaud.yml` + `compose.override.yml` + `openplaud.env`. **Vždy všechny tři** (override nese HOSTNAME=0.0.0.0 a LOCAL_STORAGE_PATH).
 - Reverse proxy: nginx `plaud.mernas.local` → 127.0.0.1:3010 (`/etc/nginx/conf.d/mernas-vhosts.conf`).
-- `/plaud-upload` nginx endpoint: přijímá API key (Bearer), injektuje session cookie → `/api/recordings/upload` (pro iPhone Shortcut upload bez session).
+- ~~`/plaud-upload`~~ (iPhone Shortcut upload přes nginx s vloženou session cookie) **zrušeno 2026-11-21** – nikdy nepoužito, cookie byla neplatná. Záloha vhostu: `/etc/nginx/mernas-vhosts.conf.bak-2026-11-21`.
 
 ### Externí závislost: pascal.local (macOS, MLX)
 - **Transkripce:** `http://pascal.local:8092/v1`, model `whisper-large-v3`, posíláme `cleanup:"true"` → server tam dělá LLM cleanup průchod. (Config v DB `api_credentials`, `is_default_transcription=t`.)
