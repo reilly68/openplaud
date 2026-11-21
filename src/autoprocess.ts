@@ -81,7 +81,22 @@ function httpPost(
 ): Promise<unknown> {
     return new Promise((resolve, reject) => {
         const body = "{}";
-        const req = http.request(
+        let settled = false;
+        let req: http.ClientRequest;
+        const hardTimer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            req.destroy(new Error(`httpPost hard timeout after ${timeoutMs}ms`));
+            reject(new Error(`httpPost hard timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+        const finish = (fn: () => void) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(hardTimer);
+            fn();
+        };
+
+        req = http.request(
             {
                 hostname: "127.0.0.1",
                 port: 3000,
@@ -100,21 +115,23 @@ function httpPost(
                     raw += c;
                 });
                 res.on("end", () => {
-                    try {
-                        resolve(JSON.parse(raw));
-                    } catch {
-                        reject(
-                            new Error(`JSON parse error: ${raw.slice(0, 120)}`),
-                        );
-                    }
+                    finish(() => {
+                        try {
+                            resolve(JSON.parse(raw));
+                        } catch {
+                            reject(
+                                new Error(`JSON parse error: ${raw.slice(0, 120)}`),
+                            );
+                        }
+                    });
                 });
-                res.on("error", reject);
+                res.on("error", (e) => finish(() => reject(e)));
             },
         );
         req.on("timeout", () =>
             req.destroy(new Error(`httpPost timeout after ${timeoutMs}ms`)),
         );
-        req.on("error", reject);
+        req.on("error", (e) => finish(() => reject(e)));
         req.write(body);
         req.end();
     });
@@ -150,10 +167,15 @@ async function runAutoProcess(): Promise<void> {
                 cookie,
                 "/api/plaud/sync",
                 60_000,
-            )) as { newRecordings?: number };
+            )) as { newRecordings?: number; errors?: string[] };
             console.log(
                 `[autoprocess] Sync: ${syncData.newRecordings ?? "?"} new recordings`,
             );
+            // The sync route answers success:true even when the Plaud call
+            // failed, so surface its error list instead of a silent "0 new".
+            for (const err of syncData.errors ?? []) {
+                console.log("[autoprocess] Sync error:", err);
+            }
         } catch (e) {
             console.log(
                 "[autoprocess] Sync error:",
